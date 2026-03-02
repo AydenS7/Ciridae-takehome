@@ -9,4 +9,7 @@ engine = create_engine(settings.database_url, future=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 
 def init_db() -> None:
+    # Ensure models are imported so Base.metadata includes them
+    from . import models  # Run
+    from . import models_items  # LineItem
     Base.metadata.create_all(bind=engine)
