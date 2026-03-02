@@ -4,6 +4,7 @@ from .routes_upload import router as upload_router
 from .routes_extract import router as runs_router
 from .routes_roommap import router as roommap_router
 from .routes_match import router as match_router
+from .routes_report import router as report_router
 from .db import init_db
 
 app = FastAPI(title="Ciridae Takehome API")
@@ -11,6 +12,7 @@ app.include_router(upload_router)
 app.include_router(runs_router)
 app.include_router(roommap_router)
 app.include_router(match_router)
+app.include_router(report_router)
 
 @app.on_event("startup")
 def _startup():
