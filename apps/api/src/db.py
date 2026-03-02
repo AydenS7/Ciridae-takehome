@@ -10,6 +10,7 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, futu
 
 def init_db() -> None:
     # Ensure models are imported so Base.metadata includes them
-    from . import models  # Run
-    from . import models_items  # LineItem
+    from . import models         # Run
+    from . import models_items   # LineItem
+    from . import models_roommap # RoomMap
     Base.metadata.create_all(bind=engine)
