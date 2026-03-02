@@ -1,9 +1,14 @@
 from fastapi import FastAPI
 from .settings import settings
 from .routes_upload import router as upload_router
+from .db import init_db
 
 app = FastAPI(title="Ciridae Takehome API")
 app.include_router(upload_router)
+
+@app.on_event("startup")
+def _startup():
+    init_db()
 
 @app.get("/health")
 def health():
