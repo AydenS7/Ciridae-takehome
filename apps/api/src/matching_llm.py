@@ -6,22 +6,36 @@ from typing import Any, Iterable
 
 from .llm_client import get_client
 from .llm_match_schemas import MatchPlan, ProposedPair
+from .llm_utils import expand_model_variants, normalize_model_list
 from .settings import settings
 
 SYSTEM_PROMPT = """You are matching line items between two repair estimates within the SAME room/area.
 
 Goal:
 - For each contractor item (Doc A), either match it to at most ONE insurance item (Doc B), or mark it unmatched.
-- Matching is based on semantic scope similarity, not only wording or price.
+- EVERY item in items_a MUST receive a ProposedPair. Do not skip any.
+- Matching is based on the actual WORK being performed, not how it is worded.
 - Do NOT match across rooms; assume lists provided are already room-scoped.
 
 Rules:
 - One-to-one: each B item can be used at most once.
-- Provide one pair for every A item.
-- If no plausible B match exists, return item_b_id=null.
-- Do not overuse null. If a close semantic candidate exists in the same room, select it and explain metadata differences in rationale.
-- IMPORTANT: Match using only the item name/description and the total amount.
-- Ignore all other table columns and metadata (quantity, unit, unit price, tax, O&P, RESET/REMOVE/REPLACE subtotals, etc.).
+- STRONGLY prefer matching over returning null. If any B item covers similar work, choose it.
+- Focus on WHAT the work is, not how it is phrased. Examples of equivalent work:
+    "demo and haul" = "debris removal" = "demolition and disposal"
+    "replace carpet" = "carpet installation" = "carpet and pad replacement"
+    "drywall repair" = "patch drywall" = "skim coat and repair"
+    "paint walls" = "interior painting" = "apply finish coat"
+    "water extraction" = "remove standing water" = "moisture mitigation"
+- Do NOT return item_b_id=null just because descriptions use different wording. Match by work category.
+- Return item_b_id=null ONLY when there is truly no B item for this type of work in this room.
+- Metadata fields (amount, qty, unit, unit_price) inform your confidence and rationale but do NOT determine whether to match — that is handled by the classification system downstream.
+
+scope_same field:
+- Set scope_same=true whenever you select a B match (item_b_id is not null) AND both items represent the same general category of work (even if worded differently).
+- Set scope_same=false only if you selected a B match but are genuinely uncertain whether the scopes truly overlap.
+- Default to scope_same=true for any match you are reasonably confident about.
+
+- For unmatched A items (item_b_id=null): set critical_blue=true if this item represents high-priority scope the insurer should cover — safety/electrical testing, permits, code compliance, environmental hazards (mold, asbestos, lead), engineering reports, specialized inspections, or items with significant liability implications.
 """
 
 REVIEWER_SYSTEM_PROMPT = """You are a second-pass reviewer for uncertain line-item matches.
@@ -32,14 +46,16 @@ You will receive:
 
 Task:
 - For each uncertain A item, evaluate the first-pass decision.
-- If first-pass is correct, keep it.
-- If incorrect, return the better B match or null.
-- Keep null only when there is genuinely no same-room semantic candidate.
-- IMPORTANT: Judge using only line-item name/description and total amount.
-- Ignore quantity/unit/rate/tax/O&P/RESET/REMOVE/REPLACE and any other columns.
+- If first-pass selected a B match: confirm it if reasonable, or return the better B if a clearly superior match exists.
+- If first-pass returned null: AGGRESSIVELY look for any B item covering similar work. Override null whenever a plausible match exists.
+- Keep null ONLY when there is truly no B item for this type of work in this room.
+- Focus on WHAT the work IS, not how it is phrased — different wording does not mean different work.
+- If amounts are in the same ballpark and the work category is similar (both are cleanup, both are flooring, both are painting, etc.), match them.
+- scope_same: set true for any match where both items cover the same general type of work. Set false only when matched but genuinely uncertain about scope overlap.
+- For items you confirm as null (unmatched): set critical_blue=true if the item represents high-priority scope — safety testing, permits, code compliance, environmental hazards, engineering reports, or items with significant liability implications.
 """
 
-_MODEL_ALIAS_MAP: dict[str, str] = {
+_MATCH_ALIAS_MAP: dict[str, str] = {
     "openai": "openai/gpt-4.1-mini",
     "chatgpt": "openai/gpt-4.1-mini",
     "gpt5": "openai/gpt-5",
@@ -86,14 +102,19 @@ def _to_brief_items(items: list[dict[str, Any]], max_len: int = 180) -> list[dic
         desc = (it["description"] or "").strip()
         if len(desc) > max_len:
             desc = desc[: max_len - 3] + "..."
-        out.append(
-            {
-                "id": it["id"],
-                "room": it["room"],
-                "desc": desc,
-                "amount": it["amount"],
-            }
-        )
+        entry: dict[str, Any] = {
+            "id": it["id"],
+            "room": it["room"],
+            "desc": desc,
+            "amount": it.get("amount"),
+        }
+        if it.get("quantity") is not None:
+            entry["qty"] = it["quantity"]
+        if it.get("unit"):
+            entry["unit"] = it["unit"]
+        if it.get("unit_price") is not None:
+            entry["unit_price"] = it["unit_price"]
+        out.append(entry)
     return out
 
 
@@ -107,55 +128,11 @@ def _best_pairs_by_a(plan: MatchPlan) -> dict[int, ProposedPair]:
 
 
 def _normalize_model_list(models: Iterable[str]) -> list[str]:
-    out: list[str] = []
-    seen: set[str] = set()
-    for raw in models:
-        token = str(raw or "").strip()
-        if not token:
-            continue
-        resolved = _MODEL_ALIAS_MAP.get(token.lower(), token)
-        key = resolved.strip().lower()
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        out.append(resolved)
-    return out
+    return normalize_model_list(models, _MATCH_ALIAS_MAP)
 
 
 def _candidate_model_variants(model_name: str) -> list[str]:
-    token = (model_name or "").strip()
-    if not token:
-        return []
-    resolved = _MODEL_ALIAS_MAP.get(token.lower(), token)
-
-    out: list[str] = []
-    seen: set[str] = set()
-
-    def add(name: str) -> None:
-        value = (name or "").strip()
-        key = value.lower()
-        if not value or key in seen:
-            return
-        seen.add(key)
-        out.append(value)
-
-    add(token)
-    add(resolved)
-
-    for base in list(out):
-        if "/" in base:
-            _, rhs = base.split("/", 1)
-            add(rhs)
-        else:
-            lower = base.lower()
-            if lower.startswith(("gpt-", "o1", "o3")):
-                add(f"openai/{base}")
-            if "claude" in lower:
-                add(f"anthropic/{base}")
-            if "gemini" in lower:
-                add(f"gemini/{base}")
-                add(f"google/{base}")
-    return out
+    return expand_model_variants(model_name, _MATCH_ALIAS_MAP)
 
 
 def _call_match_plan(

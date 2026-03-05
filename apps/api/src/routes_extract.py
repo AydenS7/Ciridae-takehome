@@ -1,5 +1,6 @@
 from fastapi import APIRouter, HTTPException
 from sqlalchemy import delete
+from time import perf_counter
 
 from .db import SessionLocal
 from .models import Run
@@ -10,6 +11,7 @@ router = APIRouter(prefix="/runs", tags=["runs"])
 
 @router.post("/{run_id}/extract")
 def extract_run(run_id: str):
+    t0 = perf_counter()
     with SessionLocal() as db:
         run = db.get(Run, run_id)
         if not run:
@@ -18,8 +20,8 @@ def extract_run(run_id: str):
         db.execute(delete(LineItem).where(LineItem.run_id == run_id))
         db.commit()
 
-        a_pages = extract_pdf_via_llm(run.proposal_a_path, doc="A")
-        b_pages = extract_pdf_via_llm(run.proposal_b_path, doc="B")
+        a_pages, a_stats = extract_pdf_via_llm(run.proposal_a_path, doc="A")
+        b_pages, b_stats = extract_pdf_via_llm(run.proposal_b_path, doc="B")
 
         def persist(doc_pages):
             n = 0
@@ -43,6 +45,9 @@ def extract_run(run_id: str):
                         page=page_result.page,
                         room=it.room,
                         description=it.description,
+                        quantity=it.quantity,
+                        unit=it.unit,
+                        unit_price=it.unit_price,
                         amount=it.total,
                     ))
                     n += 1
@@ -52,7 +57,15 @@ def extract_run(run_id: str):
         n_b = persist(b_pages)
         db.commit()
 
-        return {"run_id": run_id, "extracted": {"A": n_a, "B": n_b}}
+        elapsed_ms = int((perf_counter() - t0) * 1000)
+        return {
+            "run_id": run_id,
+            "extracted": {"A": n_a, "B": n_b},
+            "metrics": {
+                "elapsed_ms": elapsed_ms,
+                "docs": {"A": a_stats, "B": b_stats},
+            },
+        }
 
 @router.get("/{run_id}/items")
 def list_items(run_id: str, doc: str | None = None, limit: int = 200):

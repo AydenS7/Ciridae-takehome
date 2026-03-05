@@ -15,6 +15,9 @@ class LineItem(Base):
     room: Mapped[str] = mapped_column(String, default="(unknown)")
     description: Mapped[str] = mapped_column(Text)
 
+    quantity: Mapped[float | None] = mapped_column(Float, nullable=True)
+    unit: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    unit_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     amount: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
