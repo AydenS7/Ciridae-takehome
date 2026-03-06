@@ -1,3 +1,5 @@
+"""Endpoints for generating and persisting room-to-room mappings per run."""
+
 import re
 from fastapi import APIRouter, HTTPException
 from sqlalchemy import delete, func

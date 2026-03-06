@@ -1,3 +1,5 @@
+"""Endpoints for building and serving the annotated reconciliation PDF report."""
+
 from __future__ import annotations
 
 from pathlib import Path

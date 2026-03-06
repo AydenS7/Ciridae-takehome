@@ -1,3 +1,5 @@
+"""Pydantic schemas for extracted per-page estimate line items."""
+
 from __future__ import annotations
 from typing import Literal, Optional
 from pydantic import BaseModel, Field

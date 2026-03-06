@@ -1,3 +1,5 @@
+"""Room mapping engine combining deterministic scoring with LLM adjudication."""
+
 from __future__ import annotations
 
 import json

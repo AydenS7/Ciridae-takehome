@@ -1,3 +1,5 @@
+"""Small local entrypoint placeholder for the API package."""
+
 def main():
     print("Hello from api!")
 

@@ -1,3 +1,5 @@
+"""Database engine/session setup plus startup-safe schema initialization."""
+
 from pathlib import Path
 import logging
 from sqlalchemy import create_engine, inspect, text

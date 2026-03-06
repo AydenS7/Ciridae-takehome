@@ -1,3 +1,5 @@
+"""Upload endpoint that stores two proposal PDFs and creates a run record."""
+
 import uuid
 from pathlib import Path
 from fastapi import APIRouter, UploadFile, File, HTTPException

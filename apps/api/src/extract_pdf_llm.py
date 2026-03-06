@@ -1,3 +1,5 @@
+"""LLM-powered line-item extraction pipeline with model fallback and telemetry."""
+
 from __future__ import annotations
 
 import base64
@@ -28,31 +30,59 @@ _VISION_CAPABLE: frozenset[str] = frozenset({
     "anthropic/claude-3-7-sonnet-latest",
 })
 
-TEXT_SYSTEM_PROMPT = """You extract ONLY estimate line items from insurance/contractor repair estimates.
+TEXT_SYSTEM_PROMPT = """You extract ALL estimate line items from insurance/contractor repair estimates.
 
-Rules:
-- Ignore cover pages, contact info, disclaimers, claim numbers, phone numbers, dates, policy text, and summary guides.
-- Output ONLY real estimate rows (things that would be billed), not section/table headers.
-- Assign each item to a room/area/section based on the nearest heading on the page.
-- Extract all metadata columns when present: quantity, unit, unit_price (cost per unit), and total.
-- If a field is missing or not shown for a row, set it to null.
-- confidence should reflect how sure you are it is a real line item row.
+ITEM BOUNDARY RULE (most important):
+- A new line item ALWAYS starts with a number followed by a period at the LEFT margin, e.g. "1.", "2.", "15."
+- If a line does NOT start with "N.", it is a CONTINUATION of the previous item's description — NOT a new item.
+- Concatenate continuation lines into the description of the item they belong to.
+- Extract items in sequential order: 1, 2, 3, … up to the last number on the page. Do NOT skip any number.
+
+PROCESS — follow these steps in order:
+1. Read the text top-to-bottom and identify every section/room heading (e.g. "Kitchen", "Master Bedroom", "Interior").
+2. Use the "N." rule above to identify item boundaries. Any line without a leading "N." is part of the previous item.
+3. Extract EVERY numbered item. After extracting, verify: is there a ProposedItem for every number from 1 (or the first number on this page) to the last number? If not, go back and add the missing ones.
+
+Room assignment rules:
+- Each item's room = the NEAREST section heading that appears ABOVE it in the text.
+- When a new heading appears mid-page, ALL subsequent items belong to that new room — not the first heading on the page.
+- A single page WILL often contain multiple rooms. Never assign every item on the page to the same room if multiple headings exist.
+
+Per-item rules:
+- description: the full line item description text including the leading "N." number (e.g. "1. Remove and replace drywall").
+- Extract all metadata when present: quantity, unit, unit_price (cost per unit), and total.
+- If a field is missing or not shown, set it to null.
+- confidence = how sure you are this is a real billable row (0.0–1.0).
+- Ignore: cover pages, contact info, disclaimers, claim numbers, phone numbers, dates, policy text, summary guides, section headers, subtotals, and page totals.
 """
 
-VISION_SYSTEM_PROMPT = """You extract ONLY estimate line items from an insurance/contractor repair estimate page shown as an image.
+VISION_SYSTEM_PROMPT = """You extract EVERY billable line item from an insurance/contractor repair estimate page shown as an image.
 
-Rules:
-- Read the table carefully. Identify each billable line item row.
-- Ignore: cover pages, contact info, disclaimers, claim numbers, headers/footers, section headings, summary totals.
-- For each real line item extract:
-  - room: the room/area/section this item belongs to (from nearest section heading above it)
-  - description: the line item description text
+ITEM BOUNDARY RULE (most important):
+- A new line item ALWAYS starts with a number followed by a period at the LEFT margin of the page, e.g. "1.", "2.", "15."
+- If a row does NOT start with "N." at the left, it is a CONTINUATION of the previous item's description — NOT a new item. Append it to the previous item's description.
+- Extract items in sequential numerical order: 1, 2, 3, … to the last number visible. Do NOT skip any number.
+- After extracting, count: is there one entry for every number from the first to the last on this page? If not, go back and add the missing ones.
+
+PROCESS — follow these steps in order:
+1. SCAN the full image top-to-bottom and note every section/room heading and its vertical position.
+2. Use the "N." rule above to identify item boundaries. Process each numbered item in order.
+3. After extracting all items, verify sequential completeness — no number may be skipped.
+
+For each item extract:
+  - room: the room/area/section this item belongs to — determined by the NEAREST heading ABOVE it on the page. Switch room whenever a new section heading appears above the items.
+  - description: the full description including the leading "N." number (e.g. "3. Seal and prime walls"). If the item spans multiple lines, concatenate them.
   - quantity: numeric quantity if shown, else null
   - unit: unit of measure (EA, SF, LF, HR, SY, etc) if shown, else null
   - unit_price: the price per unit if shown, else null
   - total: the total cost for this line item if shown, else null
   - confidence: 0.0-1.0, how sure you are this is a real billable line item
+
+CRITICAL rules:
+- NEVER assign all items to the same room when multiple room headings are visible on the page.
+- Track heading changes as you move DOWN the page; switch room whenever a new heading is passed.
 - Do NOT output section headers, subtotals, page totals, or non-billable rows.
+- Ignore: cover pages, contact info, disclaimers, claim numbers, headers/footers.
 """
 
 _EXTRACT_ALIAS_MAP: dict[str, str] = {
@@ -110,7 +140,6 @@ def _normalize_tokens(s: str) -> list[str]:
 
 def _clean_description(text: str) -> str:
     s = re.sub(r"\s+", " ", (text or "").strip())
-    s = re.sub(r"^\d+\s*[\.\)]\s*", "", s)
     return s.strip(" -:\t")
 
 
@@ -123,6 +152,106 @@ def _has_meaningful_description(text: str) -> bool:
         return False
     alpha = sum(1 for ch in s if ch.isalpha())
     return alpha >= 4
+
+
+_ITEM_LINE_RE = re.compile(r"^\s*(\d{1,4})\s*[\.\)]\s+")
+_TABLE_HEADER_RE = re.compile(r"\b(description|qty|quantity|reset|remove|replace|tax|o&p|total|unit price|price)\b", re.IGNORECASE)
+_NON_ROOM_HEADER_RE = re.compile(
+    r"\b(subtotal|total|estimate|claim|policy|date|page|continued|deductible|overhead|profit)\b",
+    re.IGNORECASE,
+)
+
+
+def _normalize_room_heading(line: str) -> str:
+    s = re.sub(r"\s+", " ", (line or "").strip())
+    s = re.sub(r"^\s*continued\s*-\s*", "", s, flags=re.IGNORECASE)
+    s = s.strip(" -:\t")
+    return s
+
+
+def _is_room_heading_candidate(line: str) -> bool:
+    s = _normalize_room_heading(line)
+    if not s:
+        return False
+    if len(s) < 3 or len(s) > 72:
+        return False
+    if _ITEM_LINE_RE.match(s):
+        return False
+    if _TABLE_HEADER_RE.search(s):
+        return False
+    if _NON_ROOM_HEADER_RE.search(s):
+        return False
+    if "$" in s:
+        return False
+    words = re.findall(r"[a-z0-9']+", s.lower())
+    if not words or len(words) > 7:
+        return False
+    # Heuristic: heading-like lines are mostly alphabetic and short.
+    alpha_count = sum(1 for ch in s if ch.isalpha())
+    if alpha_count < 3:
+        return False
+    digit_count = sum(1 for ch in s if ch.isdigit())
+    if digit_count > 3:
+        return False
+    return True
+
+
+def _item_number_to_room_from_page_text(page_text: str) -> dict[int, str]:
+    mapping: dict[int, str] = {}
+    if not page_text:
+        return mapping
+
+    current_room: str | None = None
+    for raw_line in page_text.splitlines():
+        line = re.sub(r"\s+", " ", (raw_line or "").strip())
+        if not line:
+            continue
+
+        if _is_room_heading_candidate(line):
+            current_room = _normalize_room_heading(line)
+            continue
+
+        match = _ITEM_LINE_RE.match(line)
+        if match and current_room:
+            idx = int(match.group(1))
+            mapping[idx] = current_room
+
+    return mapping
+
+
+def _item_number_from_description(description: str) -> int | None:
+    m = _ITEM_LINE_RE.match((description or "").strip())
+    if not m:
+        return None
+    return int(m.group(1))
+
+
+def _reassign_rooms_by_heading_map(page_text: str, items: list[ExtractedItem]) -> tuple[list[ExtractedItem], int]:
+    number_to_room = _item_number_to_room_from_page_text(page_text)
+    if not number_to_room or not items:
+        return items, 0
+
+    out: list[ExtractedItem] = []
+    changed = 0
+    for it in items:
+        idx = _item_number_from_description(it.description or "")
+        target_room = number_to_room.get(idx) if idx is not None else None
+        if target_room and target_room != it.room:
+            out.append(
+                ExtractedItem(
+                    room=target_room,
+                    description=it.description,
+                    quantity=it.quantity,
+                    unit=it.unit,
+                    unit_price=it.unit_price,
+                    total=it.total,
+                    confidence=it.confidence,
+                )
+            )
+            changed += 1
+        else:
+            out.append(it)
+    return out, changed
 
 
 def _sanitize_items(items: list[ExtractedItem]) -> list[ExtractedItem]:
@@ -181,7 +310,10 @@ def _extract_via_text(
 ) -> tuple[list[ExtractedItem], str | None, int]:
     user = (
         f"Document: {doc}\nPage: {page_index}\n\n"
-        f"Extract line items from this page text:\n\n---BEGIN PAGE TEXT---\n{chunk}\n---END PAGE TEXT---"
+        f"Extract ALL line items from this page text. Remember: a new item always starts with 'N.' at the left margin. "
+        f"Lines without a leading number are continuations of the previous item — do not treat them as new items. "
+        f"Go sequentially from the first number to the last; every number must appear exactly once in your output.\n\n"
+        f"---BEGIN PAGE TEXT---\n{chunk}\n---END PAGE TEXT---"
     )
     last_error: Exception | None = None
     for idx, candidate in enumerate(candidates):
@@ -214,7 +346,14 @@ def _extract_via_vision(
     user_content = [
         {
             "type": "text",
-            "text": f"Document: {doc}\nPage: {page_index}\n\nExtract all estimate line items from this page.",
+            "text": (
+                f"Document: {doc}\nPage: {page_index}\n\n"
+                "Scan top-to-bottom: identify every room/section heading and its position on the page. "
+                "A new item ALWAYS starts with 'N.' at the LEFT margin (e.g. '1.', '12.'). "
+                "Any row that does NOT start with a number-period is a continuation of the previous item — do not split it out as a new item. "
+                "Extract items in sequential order; every number from first to last must appear exactly once. "
+                "Switch room whenever a new section heading appears above the items."
+            ),
         },
         {
             "type": "image_url",
@@ -309,6 +448,7 @@ def _extract_page(
     page_attempts = 0
     chunks_with_items = 0
     vision_used = False
+    room_reassignments = 0
     min_conf_primary = float(settings.extract_min_confidence_primary)
 
     # Vision extraction — primary path when enabled
@@ -330,6 +470,8 @@ def _extract_page(
                 if v_items:
                     page_items = [it for it in v_items if float(it.confidence) >= min_conf_primary]
                     if page_items:
+                        page_items, changed = _reassign_rooms_by_heading_map(text, page_items)
+                        room_reassignments += changed
                         return ExtractPageResult(doc=doc, page=page_index, items=page_items), {
                             "page": page_index,
                             "chunks_total": 1,
@@ -337,6 +479,7 @@ def _extract_page(
                             "attempts": page_attempts,
                             "model_usage": dict(page_model_usage),
                             "vision_used": True,
+                            "room_reassignments": room_reassignments,
                         }
             except Exception:
                 pass  # fall through to text extraction
@@ -381,6 +524,8 @@ def _extract_page(
         if len(page_items) > before_count:
             chunks_with_items += 1
 
+    page_items, changed = _reassign_rooms_by_heading_map(text, page_items)
+    room_reassignments += changed
     return ExtractPageResult(doc=doc, page=page_index, items=page_items), {
         "page": page_index,
         "chunks_total": len(chunks),
@@ -388,6 +533,7 @@ def _extract_page(
         "attempts": page_attempts,
         "model_usage": dict(page_model_usage),
         "vision_used": vision_used,
+        "room_reassignments": room_reassignments,
     }
 
 
@@ -400,6 +546,7 @@ def extract_pdf_via_llm(pdf_path: str, doc: Doc) -> tuple[list[ExtractPageResult
     max_workers = max(1, int(settings.extract_max_workers))
     model_usage: Counter[str] = Counter()
     pages_seen = pages_processed = chunks_total = chunks_with_items = model_attempts = vision_pages = 0
+    room_reassignments_total = 0
 
     # Build ordered list of vision-capable model candidates
     vision_model = _resolve_model(settings.extract_vision_model)
@@ -452,6 +599,7 @@ def extract_pdf_via_llm(pdf_path: str, doc: Doc) -> tuple[list[ExtractPageResult
                 model_attempts += int(page_stats.get("attempts", 0))
                 if page_stats.get("vision_used"):
                     vision_pages += 1
+                room_reassignments_total += int(page_stats.get("room_reassignments", 0))
                 for model_name, count in (page_stats.get("model_usage") or {}).items():
                     model_usage[str(model_name)] += int(count)
             results = sorted(page_results, key=lambda r: int(r.page))
@@ -470,5 +618,6 @@ def extract_pdf_via_llm(pdf_path: str, doc: Doc) -> tuple[list[ExtractPageResult
         "chunks_total": chunks_total,
         "chunks_with_items": chunks_with_items,
         "model_attempts": model_attempts,
+        "room_reassignments": room_reassignments_total,
         "model_usage": dict(model_usage),
     }

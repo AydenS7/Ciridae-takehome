@@ -1,3 +1,5 @@
+"""FastAPI application bootstrap: middleware, routers, startup, and health checks."""
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from .settings import settings

@@ -1,3 +1,5 @@
+"""Experimental LangGraph workflow scaffold kept for local prototyping."""
+
 from typing import Annotated
 
 from typing_extensions import TypedDict

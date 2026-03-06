@@ -1,3 +1,5 @@
+"""Streaming endpoint that runs extract, room-map, match, and report in sequence."""
+
 from __future__ import annotations
 
 import json

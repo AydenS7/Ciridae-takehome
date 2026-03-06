@@ -1,3 +1,5 @@
+"""PDF annotation renderer for reconciliation highlights and summary notes."""
+
 from __future__ import annotations
 
 import io
@@ -37,6 +39,22 @@ def _description_candidates(description: str) -> list[str]:
     if not raw:
         return []
 
+    # If the description starts with "N." extract number-anchored candidates as primary locators.
+    # The item number is a reliable unique anchor in the source PDF.
+    num_anchor_candidates: list[str] = []
+    num_match = re.match(r"^(\d+)\.\s*(.+)", raw)
+    if num_match:
+        num = num_match.group(1)
+        rest = num_match.group(2).strip()
+        rest_words = rest.split()
+        # "N. first two words" — tight, unique anchor
+        num_first2 = f"{num}. {' '.join(rest_words[:2])}" if len(rest_words) >= 2 else f"{num}. {rest}"
+        # "N. first four words" — slightly longer anchor
+        num_first4 = f"{num}. {' '.join(rest_words[:4])}" if len(rest_words) >= 4 else None
+        num_anchor_candidates.append(num_first2)
+        if num_first4:
+            num_anchor_candidates.append(num_first4)
+
     no_num = re.sub(r"^\d+\.\s*", "", raw)
     no_qty = re.sub(r"\b\d+(?:\.\d+)?\s*(?:EA|LF|SF|SQ|SY|HR|MO|WK|DAY)\b", "", no_num, flags=re.IGNORECASE)
     no_money = re.sub(r"\$?\d[\d,]*(?:\.\d{2})?", "", no_qty)
@@ -47,7 +65,8 @@ def _description_candidates(description: str) -> list[str]:
     first6 = " ".join(words[:6]) if len(words) >= 6 else compact
     first8 = " ".join(words[:8]) if len(words) >= 8 else compact
 
-    candidates = [raw, no_num, compact, first8, first6, first4]
+    # Number-anchored candidates come first so the item number is the primary search target.
+    candidates = num_anchor_candidates + [raw, no_num, compact, first8, first6, first4]
     seen: set[str] = set()
     ordered: list[str] = []
     for c in candidates:
@@ -215,8 +234,14 @@ def _quad_points_for_rect(rect: tuple[float, float, float, float]) -> ArrayObjec
     )
 
 
+def _item_number_prefix(desc: str) -> str:
+    m = re.match(r"^\s*(\d+)\s*[\.\)]\s*", (desc or ""))
+    return f"[#{m.group(1)}] " if m else ""
+
+
 def _comment_for_row(row: dict) -> str:
     status = (row.get("status") or "").lower()
+    item_prefix = _item_number_prefix(row.get("a_desc", ""))
     room_a = _cut(row.get("room_a", ""), 50)
     room_b = _cut(row.get("room_b", ""), 50)
     a_desc = _cut(row.get("a_desc", ""), 140)
@@ -232,17 +257,17 @@ def _comment_for_row(row: dict) -> str:
         a_desc_lower = (a_desc or "").lower()
         if critical_blue and ("megohmmeter" in a_desc_lower or ("electrical" in a_desc_lower and "test" in a_desc_lower)):
             return (
-                "The adjuster's estimate does not include any line item for electrical testing such as a "
+                f"{item_prefix}The adjuster's estimate does not include any line item for electrical testing such as a "
                 "Megohmmeter check; it appears this work was excluded from the adjuster's scope."
             )
         if critical_blue:
             return (
-                f"Room: {room_a}. "
+                f"{item_prefix}Room: {room_a}. "
                 f'High-priority JDR-only scope item "{a_desc}" at {_money(a_amt)} was not found in the insurance estimate. '
                 "Review for potential scope omission."
             )
         return (
-            f"Room: {room_a}. "
+            f"{item_prefix}Room: {room_a}. "
             f'The contractor estimate includes "{a_desc}" at {_money(a_amt)}, '
             "but no comparable item was found in the insurance estimate."
         )
@@ -265,7 +290,7 @@ def _comment_for_row(row: dict) -> str:
             meta_parts.append(f"unit: {a_unit} vs {b_unit}")
         meta_str = ("; ".join(meta_parts)) if meta_parts else f"difference: {diff_str}"
         core = (
-            f"Rooms: {room_a} vs {room_b}. "
+            f"{item_prefix}Rooms: {room_a} vs {room_b}. "
             f'Contractor lists "{a_desc}" at {_money(a_amt)} while insurance lists '
             f'"{b_desc}" at {_money(b_amt)} ({meta_str}).'
         )
@@ -275,7 +300,7 @@ def _comment_for_row(row: dict) -> str:
 
     if status == "green":
         return (
-            f"Rooms: {room_a} vs {room_b}. "
+            f"{item_prefix}Rooms: {room_a} vs {room_b}. "
             f'Items align: contractor "{a_desc}" at {_money(a_amt)} and insurance "{b_desc}" at {_money(b_amt)} '
             f"(difference: {diff_str}, within ±2%)."
         )
@@ -287,7 +312,7 @@ def _comment_for_row(row: dict) -> str:
         )
 
     return (
-        f"Rooms: {room_a} vs {room_b}. "
+        f"{item_prefix}Rooms: {room_a} vs {room_b}. "
         f'Contractor "{a_desc}" {_money(a_amt)} vs insurance "{b_desc}" {_money(b_amt)}.'
     )
 
@@ -394,14 +419,18 @@ def render_report_pdf(
             "anchored_room_notes_added": 0,
         }
 
+    def _item_num(desc: str) -> int:
+        m = re.match(r"^\s*(\d+)\s*[\.\)]\s*", (desc or ""))
+        return int(m.group(1)) if m else 9999
+
     status_rank = {"orange": 0, "blue": 1, "green": 2, "nugget": 3}
     rows_sorted = sorted(
         rows,
         key=lambda r: (
             int(r.get("a_page") or 10_000),
+            _item_num(r.get("a_desc", "")),
             status_rank.get((r.get("status") or "").lower(), 99),
             (r.get("room_a") or "").lower(),
-            (r.get("a_desc") or "").lower(),
         ),
     )
 

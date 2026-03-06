@@ -1,3 +1,5 @@
+"""Pydantic schemas for room-link proposals between estimate documents."""
+
 from __future__ import annotations
 from pydantic import BaseModel, Field
 

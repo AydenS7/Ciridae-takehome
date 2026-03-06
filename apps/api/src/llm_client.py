@@ -1,3 +1,5 @@
+"""OpenAI-compatible client factory bound to the configured gateway."""
+
 import os
 from openai import OpenAI
 from .settings import settings

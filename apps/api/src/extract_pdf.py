@@ -1,3 +1,5 @@
+"""Rule-based text extractor for estimate PDFs when layout is parseable as text."""
+
 from __future__ import annotations
 
 import re

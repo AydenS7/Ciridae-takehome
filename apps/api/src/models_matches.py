@@ -1,3 +1,5 @@
+"""SQLAlchemy model for persisted item-to-item match decisions and statuses."""
+
 from datetime import datetime
 from sqlalchemy import String, DateTime, Integer, Float, Text
 from sqlalchemy.orm import Mapped, mapped_column

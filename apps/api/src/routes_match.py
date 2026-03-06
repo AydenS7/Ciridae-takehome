@@ -1,7 +1,10 @@
+"""Endpoints and helper logic for room-scoped line-item matching classification."""
+
 from __future__ import annotations
 
 import heapq
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from time import perf_counter
@@ -679,6 +682,78 @@ def _critical_blue_by_a(plan) -> dict[int, bool]:
             result[p.item_a_id] = True
     return result
 
+def _run_llm_for_room(
+    *,
+    room_a: str,
+    room_b: str,
+    a_dicts: list,
+    b_dicts: list,
+    first_pass_unsure_conf: float,
+    first_pass_unsure_null_conf: float,
+    first_pass_scope_unsure_conf: float,
+    force_review_on_null: bool,
+) -> dict:
+    """Run first- and second-pass LLM matching for one room. Called in parallel across rooms."""
+    first_pass = propose_matches_for_room(room_a, room_b, a_dicts, b_dicts)
+    first_best_for_a = _best_pairs_by_a(first_pass)
+    first_critical_blue = _critical_blue_by_a(first_pass)
+
+    first_pass_unsure_ids: set[int] = set()
+    for a in a_dicts:
+        a_id = int(a["id"])
+        choice = first_best_for_a.get(a_id)
+        if choice is None:
+            first_pass_unsure_ids.add(a_id)
+            continue
+        item_b_id, scope_same, conf, _ = choice
+        if item_b_id is None and force_review_on_null:
+            first_pass_unsure_ids.add(a_id)
+            continue
+        if conf < first_pass_unsure_conf:
+            first_pass_unsure_ids.add(a_id)
+            continue
+        if item_b_id is None and conf < first_pass_unsure_null_conf:
+            first_pass_unsure_ids.add(a_id)
+            continue
+        if (not bool(scope_same)) and conf < first_pass_scope_unsure_conf:
+            first_pass_unsure_ids.add(a_id)
+
+    second_best_for_a: dict = {}
+    second_critical_blue: dict = {}
+    second_pass_reviewed_count = 0
+    second_pass_rooms_invoked = 0
+
+    if first_pass_unsure_ids:
+        uncertain_a_dicts = [x for x in a_dicts if int(x["id"]) in first_pass_unsure_ids]
+        first_pass_uncertain_by_a = {
+            a_id: first_best_for_a[a_id]
+            for a_id in first_pass_unsure_ids
+            if a_id in first_best_for_a
+        }
+        second_pass = propose_matches_for_room_ensemble(
+            room_a,
+            room_b,
+            uncertain_a_dicts,
+            b_dicts,
+            first_pass_by_a=first_pass_uncertain_by_a,
+        )
+        second_best_for_a = _best_pairs_by_a(second_pass)
+        second_critical_blue = _critical_blue_by_a(second_pass)
+        second_pass_reviewed_count = len(first_pass_unsure_ids)
+        second_pass_rooms_invoked = 1
+
+    return {
+        "first_best_for_a": first_best_for_a,
+        "first_critical_blue": first_critical_blue,
+        "second_best_for_a": second_best_for_a,
+        "second_critical_blue": second_critical_blue,
+        "first_pass_total_evaluated": len(a_dicts),
+        "first_pass_uncertain_count": len(first_pass_unsure_ids),
+        "second_pass_reviewed_count": second_pass_reviewed_count,
+        "second_pass_rooms_invoked": second_pass_rooms_invoked,
+    }
+
+
 @router.post("/{run_id}/match")
 def match_run(run_id: str, min_room_confidence: float = 0.6, min_pair_confidence: float | None = None):
     """
@@ -797,6 +872,8 @@ def match_run(run_id: str, min_room_confidence: float = 0.6, min_pair_confidence
         critical_blue_items: list[dict[str, object]] = []
         globally_used_b_ids: set[int] = set()
 
+        # ── Phase 1: pre-fetch all room data (sequential DB reads, no LLM) ──────────
+        room_preps: list[dict] = []
         for room_a in rooms_a:
             room_links = links_by_room_a.get(room_a, [])
             a_items = (
@@ -897,22 +974,12 @@ def match_run(run_id: str, min_room_confidence: float = 0.6, min_pair_confidence
                     )
 
             if not b_items:
-                for a_item in a_items:
-                    db.add(
-                        Match(
-                            run_id=run_id,
-                            room_a=room_a,
-                            room_b=room_b,
-                            item_a_id=a_item.id,
-                            item_b_id=None,
-                            status="blue",
-                            similarity=0.0,
-                            rationale="mapped room has no Doc B items after fallback expansion",
-                        )
-                    )
-                    inserted += 1
-                    status_counts["blue"] = int(status_counts.get("blue", 0)) + 1
-                    matched_a_ids_seen.add(a_item.id)
+                room_preps.append({
+                    "room_a": room_a, "room_b": room_b, "a_items": a_items,
+                    "b_items": [], "a_dicts": [], "b_dicts": [], "b_by_id": {},
+                    "room_map_mode": room_map_mode, "room_alias_expanded": False,
+                    "llm_needed": False,
+                })
                 continue
 
             # Metadata-aware matching payloads (description + total + key metadata).
@@ -941,54 +1008,74 @@ def match_run(run_id: str, min_room_confidence: float = 0.6, min_pair_confidence
                 for x in b_items
             ]
             b_by_id = {x.id: x for x in b_items}
+            room_preps.append({
+                "room_a": room_a, "room_b": room_b,
+                "a_items": a_items, "b_items": b_items,
+                "a_dicts": a_dicts, "b_dicts": b_dicts, "b_by_id": b_by_id,
+                "room_map_mode": room_map_mode, "room_alias_expanded": room_alias_expanded,
+                "llm_needed": True,
+            })
 
-            first_pass = propose_matches_for_room(room_a, room_b, a_dicts, b_dicts)
-            first_best_for_a = _best_pairs_by_a(first_pass)
-            first_critical_blue = _critical_blue_by_a(first_pass)
-            first_pass_total_evaluated += len(a_items)
-
-            first_pass_unsure_ids: set[int] = set()
-            for a_item in a_items:
-                choice = first_best_for_a.get(a_item.id)
-                if choice is None:
-                    first_pass_unsure_ids.add(a_item.id)
-                    continue
-                item_b_id, scope_same, conf, _ = choice
-                if item_b_id is None and force_review_on_null:
-                    first_pass_unsure_ids.add(a_item.id)
-                    continue
-                if conf < first_pass_unsure_conf:
-                    first_pass_unsure_ids.add(a_item.id)
-                    continue
-                if item_b_id is None and conf < first_pass_unsure_null_conf:
-                    first_pass_unsure_ids.add(a_item.id)
-                    continue
-                if (not bool(scope_same)) and conf < first_pass_scope_unsure_conf:
-                    first_pass_unsure_ids.add(a_item.id)
-            first_pass_uncertain_count += len(first_pass_unsure_ids)
-
-            uncertain_a_ids = set(first_pass_unsure_ids)
-
-            second_best_for_a: dict[int, tuple[int | None, bool, float, str]] = {}
-            second_critical_blue: dict[int, bool] = {}
-            if uncertain_a_ids:
-                uncertain_a_dicts = [x for x in a_dicts if int(x["id"]) in uncertain_a_ids]
-                first_pass_uncertain_by_a = {
-                    a_id: first_best_for_a[a_id]
-                    for a_id in uncertain_a_ids
-                    if a_id in first_best_for_a
+        # ── Phase 2: LLM passes for all rooms in parallel ────────────────────────────
+        llm_results: dict[int, dict] = {}
+        llm_needed_indices = [(i, p) for i, p in enumerate(room_preps) if p["llm_needed"]]
+        if llm_needed_indices:
+            with ThreadPoolExecutor(max_workers=max(1, min(8, len(llm_needed_indices)))) as ex:
+                futures = {
+                    ex.submit(
+                        _run_llm_for_room,
+                        room_a=prep["room_a"],
+                        room_b=prep["room_b"],
+                        a_dicts=prep["a_dicts"],
+                        b_dicts=prep["b_dicts"],
+                        first_pass_unsure_conf=first_pass_unsure_conf,
+                        first_pass_unsure_null_conf=first_pass_unsure_null_conf,
+                        first_pass_scope_unsure_conf=first_pass_scope_unsure_conf,
+                        force_review_on_null=force_review_on_null,
+                    ): i
+                    for i, prep in llm_needed_indices
                 }
-                second_pass = propose_matches_for_room_ensemble(
-                    room_a,
-                    room_b,
-                    uncertain_a_dicts,
-                    b_dicts,
-                    first_pass_by_a=first_pass_uncertain_by_a,
-                )
-                second_best_for_a = _best_pairs_by_a(second_pass)
-                second_critical_blue = _critical_blue_by_a(second_pass)
-                second_pass_reviewed_count += len(uncertain_a_ids)
-                second_pass_rooms_invoked += 1
+                for fut in as_completed(futures):
+                    llm_results[futures[fut]] = fut.result()
+
+        # ── Phase 3: assignment + DB writes (sequential, maintains globally_used_b_ids) ──
+        for i, prep in enumerate(room_preps):
+            room_a = prep["room_a"]
+            room_b = prep["room_b"]
+            a_items = prep["a_items"]
+            b_items = prep["b_items"]
+            b_by_id = prep["b_by_id"]
+            room_map_mode = prep["room_map_mode"]
+            room_alias_expanded = prep["room_alias_expanded"]
+
+            if not prep["llm_needed"]:
+                for a_item in a_items:
+                    db.add(
+                        Match(
+                            run_id=run_id,
+                            room_a=room_a,
+                            room_b=room_b,
+                            item_a_id=a_item.id,
+                            item_b_id=None,
+                            status="blue",
+                            similarity=0.0,
+                            rationale="mapped room has no Doc B items after fallback expansion",
+                        )
+                    )
+                    inserted += 1
+                    status_counts["blue"] = int(status_counts.get("blue", 0)) + 1
+                    matched_a_ids_seen.add(a_item.id)
+                continue
+
+            llm_result = llm_results[i]
+            first_best_for_a = llm_result["first_best_for_a"]
+            first_critical_blue = llm_result["first_critical_blue"]
+            second_best_for_a = llm_result["second_best_for_a"]
+            second_critical_blue = llm_result["second_critical_blue"]
+            first_pass_total_evaluated += llm_result["first_pass_total_evaluated"]
+            first_pass_uncertain_count += llm_result["first_pass_uncertain_count"]
+            second_pass_reviewed_count += llm_result["second_pass_reviewed_count"]
+            second_pass_rooms_invoked += llm_result["second_pass_rooms_invoked"]
 
             # Build one candidate per A item (prefer second-pass decision when available).
             candidate_for_a: dict[int, dict] = {}

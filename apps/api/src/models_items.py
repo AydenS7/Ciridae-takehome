@@ -1,3 +1,5 @@
+"""SQLAlchemy model for extracted line items from both documents."""
+
 from datetime import datetime
 from sqlalchemy import String, DateTime, Integer, Float, Text
 from sqlalchemy.orm import Mapped, mapped_column

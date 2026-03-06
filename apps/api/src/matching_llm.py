@@ -1,7 +1,11 @@
+"""LLM orchestration for room-scoped line-item matching and reviewer fallback."""
+
 from __future__ import annotations
 
 import json
+import re
 from collections import Counter
+from difflib import SequenceMatcher
 from typing import Any, Iterable
 
 from .llm_client import get_client
@@ -11,49 +15,89 @@ from .settings import settings
 
 SYSTEM_PROMPT = """You are matching line items between two repair estimates within the SAME room/area.
 
+Item format note:
+- Contractor (Doc A) items typically begin with a number and period, e.g. "1. Remove and replace drywall".
+  Use this leading number to uniquely identify and reference each item.
+- EVERY A item in the input MUST produce exactly one ProposedPair in the output — no exceptions, no omissions.
+  If you finish and your output count does not match the number of A items provided, you have missed items — go back and add them.
+
 Goal:
-- For each contractor item (Doc A), either match it to at most ONE insurance item (Doc B), or mark it unmatched.
-- EVERY item in items_a MUST receive a ProposedPair. Do not skip any.
-- Matching is based on the actual WORK being performed, not how it is worded.
-- Do NOT match across rooms; assume lists provided are already room-scoped.
+- For each contractor item (Doc A), return exactly one ProposedPair.
+- One-to-one: each B item can be used at most once.
+- STRONGLY prefer matching over null.
+
+You must process each A item individually using this checklist:
+1) Check exact_name_candidates_by_a[item_a_id]. If present, evaluate those first.
+2) Check near_name_candidates_by_a[item_a_id]. If present, evaluate those next.
+3) If no exact wording match exists, compare against remaining room-scoped B items for best same-task match.
+4) Return null ONLY when no B item in the room plausibly describes the same underlying work.
 
 Rules:
-- One-to-one: each B item can be used at most once.
-- STRONGLY prefer matching over returning null. If any B item covers similar work, choose it.
-- Focus on WHAT the work is, not how it is phrased. Examples of equivalent work:
-    "demo and haul" = "debris removal" = "demolition and disposal"
-    "replace carpet" = "carpet installation" = "carpet and pad replacement"
-    "drywall repair" = "patch drywall" = "skim coat and repair"
-    "paint walls" = "interior painting" = "apply finish coat"
-    "water extraction" = "remove standing water" = "moisture mitigation"
-- Do NOT return item_b_id=null just because descriptions use different wording. Match by work category.
-- Return item_b_id=null ONLY when there is truly no B item for this type of work in this room.
-- Metadata fields (amount, qty, unit, unit_price) inform your confidence and rationale but do NOT determine whether to match — that is handled by the classification system downstream.
+- Exact wording matches in same room should almost always be matched (not blue).
+- If multiple exact wording matches exist, choose the one with best metadata alignment (amount, quantity, unit, unit_price).
+- After exact wording, use semantic same-task matching as fallback; do not force null just because wording differs.
+- Do not skip items; emit one pair for every A id.
+- Metadata drives green vs orange downstream:
+  - green requires scope match + key metadata within ±2%
+  - orange is scope match but metadata differs beyond ±2%
+  Therefore, when selecting among plausible B candidates, prefer the candidate with closest metadata alignment.
+- If matched and work is same task, set scope_same=true.
+- Set scope_same=false only when matched but genuinely uncertain.
+- Rationale must mention which checklist step decided the match (exact-wording / near-wording / semantic-fallback / true-unmatched)
+  and briefly mention metadata alignment quality.
 
-scope_same field:
-- Set scope_same=true whenever you select a B match (item_b_id is not null) AND both items represent the same general category of work (even if worded differently).
-- Set scope_same=false only if you selected a B match but are genuinely uncertain whether the scopes truly overlap.
-- Default to scope_same=true for any match you are reasonably confident about.
-
-- For unmatched A items (item_b_id=null): set critical_blue=true if this item represents high-priority scope the insurer should cover — safety/electrical testing, permits, code compliance, environmental hazards (mold, asbestos, lead), engineering reports, specialized inspections, or items with significant liability implications.
+For unmatched A items (item_b_id=null): set critical_blue=true if this item is high-priority scope
+(electrical/safety testing, permits, code compliance, hazards, engineering/inspection, liability-critical work).
 """
 
 REVIEWER_SYSTEM_PROMPT = """You are a second-pass reviewer for uncertain line-item matches.
 
-You will receive:
-- room-scoped items from both documents
-- first-pass decision and rationale per uncertain A item
+You receive room-scoped A/B items plus first-pass decisions.
 
-Task:
-- For each uncertain A item, evaluate the first-pass decision.
-- If first-pass selected a B match: confirm it if reasonable, or return the better B if a clearly superior match exists.
-- If first-pass returned null: AGGRESSIVELY look for any B item covering similar work. Override null whenever a plausible match exists.
-- Keep null ONLY when there is truly no B item for this type of work in this room.
-- Focus on WHAT the work IS, not how it is phrased — different wording does not mean different work.
-- If amounts are in the same ballpark and the work category is similar (both are cleanup, both are flooring, both are painting, etc.), match them.
-- scope_same: set true for any match where both items cover the same general type of work. Set false only when matched but genuinely uncertain about scope overlap.
-- For items you confirm as null (unmatched): set critical_blue=true if the item represents high-priority scope — safety testing, permits, code compliance, environmental hazards, engineering reports, or items with significant liability implications.
+Item format note:
+- Contractor (Doc A) items typically begin with a number and period, e.g. "3. Seal and prime walls".
+  Use this leading number to uniquely identify each item and ensure none are missed.
+- EVERY uncertain A item passed to you MUST produce exactly one ProposedPair in your output.
+  Count the input items and verify your output count matches before finishing.
+
+Reviewer checklist for each uncertain A item:
+1) Re-check exact_name_candidates_by_a[item_a_id].
+2) Re-check near_name_candidates_by_a[item_a_id].
+3) Validate/override first-pass decision using same-room best match.
+4) Keep null only if truly no plausible same-task B item exists.
+
+Rules:
+- STRONGLY prefer matching over null.
+- If first pass returned null but exact same-name candidate exists, override null unless clearly wrong.
+- If multiple candidates exist, pick the one with strongest wording alignment, then best metadata alignment.
+- If no exact wording match exists, use semantic same-task fallback rather than overusing null.
+- If matched and same task, set scope_same=true.
+- Set scope_same=false only when matched but uncertain.
+- Rationale must explicitly state why you confirmed/overrode first pass and which checklist step was used.
+- Remember: downstream status is metadata-based (green within ±2%, orange otherwise), so prefer candidates
+  whose metadata is closest when scope is comparable.
+
+For unmatched A items (item_b_id=null): set critical_blue=true for high-priority omitted scope
+(electrical/safety testing, permits, code compliance, hazards, engineering/inspection, liability-critical work).
 """
+
+_TOKEN_RE = re.compile(r"[a-z0-9']+")
+_STOPWORDS = {
+    "the",
+    "and",
+    "for",
+    "with",
+    "per",
+    "to",
+    "of",
+    "in",
+    "on",
+    "by",
+    "at",
+    "or",
+    "a",
+    "an",
+}
 
 _MATCH_ALIAS_MAP: dict[str, str] = {
     "openai": "openai/gpt-4.1-mini",
@@ -94,6 +138,212 @@ def get_match_telemetry() -> dict[str, Any]:
         "reviewer_fallbacks": int(_MATCH_REVIEWER_FALLBACKS),
         "models_used": dict(_MATCH_MODEL_USAGE),
     }
+
+
+def _normalize_desc(text: str) -> str:
+    s = re.sub(r"^\s*\d+\s*[\.\)]\s*", "", (text or "").strip().lower())
+    toks = [tok for tok in _TOKEN_RE.findall(s) if tok and tok not in _STOPWORDS]
+    return " ".join(toks)
+
+
+def _desc_tokens(text: str) -> set[str]:
+    return set(_normalize_desc(text).split())
+
+
+def _token_jaccard(a: set[str], b: set[str]) -> float:
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    union = len(a | b)
+    if union == 0:
+        return 0.0
+    return inter / union
+
+
+def _build_name_match_hints(items_a: list[dict[str, Any]], items_b: list[dict[str, Any]]) -> dict[str, Any]:
+    b_norm_map: dict[str, list[int]] = {}
+    b_desc_by_id: dict[int, str] = {}
+    b_tokens_by_id: dict[int, set[str]] = {}
+
+    for b in items_b:
+        b_id = int(b["id"])
+        b_desc = str(b.get("description") or "")
+        b_norm = _normalize_desc(b_desc)
+        b_desc_by_id[b_id] = b_desc
+        b_tokens_by_id[b_id] = _desc_tokens(b_desc)
+        if b_norm:
+            b_norm_map.setdefault(b_norm, []).append(b_id)
+
+    exact_name_candidates_by_a: dict[str, list[int]] = {}
+    near_name_candidates_by_a: dict[str, list[dict[str, Any]]] = {}
+
+    for a in items_a:
+        a_id = int(a["id"])
+        a_desc = str(a.get("description") or "")
+        a_norm = _normalize_desc(a_desc)
+        a_tokens = _desc_tokens(a_desc)
+
+        exact_ids = list(b_norm_map.get(a_norm, []))
+        if not exact_ids and a_tokens:
+            for b_id, b_tokens in b_tokens_by_id.items():
+                if a_tokens == b_tokens and len(a_tokens) >= 2:
+                    exact_ids.append(int(b_id))
+        if exact_ids:
+            exact_name_candidates_by_a[str(a_id)] = exact_ids[:8]
+
+        near: list[tuple[float, int]] = []
+        for b_id, b_desc in b_desc_by_id.items():
+            b_norm = _normalize_desc(b_desc)
+            if not a_norm or not b_norm:
+                continue
+            seq = SequenceMatcher(None, a_norm, b_norm).ratio()
+            jacc = _token_jaccard(a_tokens, b_tokens_by_id.get(b_id, set()))
+            score = max(seq, jacc, (0.65 * seq) + (0.35 * jacc))
+            if score >= 0.64:
+                near.append((score, int(b_id)))
+        near.sort(key=lambda x: x[0], reverse=True)
+        if near:
+            near_name_candidates_by_a[str(a_id)] = [
+                {"item_b_id": b_id, "similarity": round(score, 3)}
+                for score, b_id in near[:6]
+            ]
+
+    return {
+        "exact_name_candidates_by_a": exact_name_candidates_by_a,
+        "near_name_candidates_by_a": near_name_candidates_by_a,
+    }
+
+
+def _pct_diff(a: float | None, b: float | None) -> float:
+    if a is None or b is None:
+        return float("inf")
+    denom = max(abs(b), 1e-9)
+    return abs(a - b) / denom
+
+
+def _metadata_alignment_score(a: dict[str, Any], b: dict[str, Any]) -> float:
+    score = 0.0
+    weight = 0.0
+
+    a_amount = a.get("amount")
+    b_amount = b.get("amount")
+    if a_amount is not None and b_amount is not None:
+        score += max(0.0, 1.0 - min(1.0, _pct_diff(float(a_amount), float(b_amount))))
+        weight += 1.6
+
+    a_qty = a.get("quantity")
+    b_qty = b.get("quantity")
+    if a_qty is not None and b_qty is not None:
+        score += max(0.0, 1.0 - min(1.0, _pct_diff(float(a_qty), float(b_qty))))
+        weight += 1.0
+
+    a_up = a.get("unit_price")
+    b_up = b.get("unit_price")
+    if a_up is not None and b_up is not None:
+        score += max(0.0, 1.0 - min(1.0, _pct_diff(float(a_up), float(b_up))))
+        weight += 1.0
+
+    a_unit = str(a.get("unit") or "").strip().lower()
+    b_unit = str(b.get("unit") or "").strip().lower()
+    if a_unit and b_unit:
+        score += 1.0 if a_unit == b_unit else 0.0
+        weight += 0.8
+
+    if weight <= 0.0:
+        return 0.0
+    return score / weight
+
+
+def _enforce_exact_wording_matches(
+    plan: MatchPlan,
+    *,
+    items_a: list[dict[str, Any]],
+    items_b: list[dict[str, Any]],
+) -> MatchPlan:
+    hints = _build_name_match_hints(items_a, items_b)
+    exact_by_a_raw = hints.get("exact_name_candidates_by_a", {})
+    if not isinstance(exact_by_a_raw, dict) or not exact_by_a_raw:
+        return plan
+
+    a_by_id = {int(x["id"]): x for x in items_a}
+    b_by_id = {int(x["id"]): x for x in items_b}
+    best = _best_pairs_by_a(plan)
+
+    # Keep exact matches already selected by model; build a baseline used set.
+    used_b: set[int] = set()
+    for a_id, pair in list(best.items()):
+        exact_ids = [int(v) for v in (exact_by_a_raw.get(str(a_id)) or []) if int(v) in b_by_id]
+        if pair.item_b_id is not None and int(pair.item_b_id) in exact_ids:
+            used_b.add(int(pair.item_b_id))
+
+    # Build exact-match assignment candidates with metadata tie-breaker.
+    assignment_candidates: list[tuple[float, int, int]] = []
+    for a_id_raw, b_ids_raw in exact_by_a_raw.items():
+        a_id = int(a_id_raw)
+        a_item = a_by_id.get(a_id)
+        if a_item is None:
+            continue
+        for b_id_any in b_ids_raw:
+            b_id = int(b_id_any)
+            b_item = b_by_id.get(b_id)
+            if b_item is None:
+                continue
+            meta_score = _metadata_alignment_score(a_item, b_item)
+            assignment_candidates.append((meta_score, a_id, b_id))
+
+    assignment_candidates.sort(key=lambda x: x[0], reverse=True)
+    assigned_a: set[int] = set()
+    assigned_b: set[int] = set(used_b)
+    forced: dict[int, int] = {}
+    for meta_score, a_id, b_id in assignment_candidates:
+        if a_id in assigned_a or b_id in assigned_b:
+            continue
+        assigned_a.add(a_id)
+        assigned_b.add(b_id)
+        forced[a_id] = b_id
+
+    if not forced:
+        return plan
+
+    for a_id, b_id in forced.items():
+        a_item = a_by_id[a_id]
+        b_item = b_by_id[b_id]
+        meta_score = _metadata_alignment_score(a_item, b_item)
+        current = best.get(a_id)
+        rationale = (
+            "exact-wording override: selected same-name candidate first; "
+            f"metadata_alignment={meta_score:.2f} for downstream green/orange classification"
+        )
+        confidence = max(0.93, float(current.confidence) if current is not None else 0.0)
+        best[a_id] = ProposedPair(
+            item_a_id=a_id,
+            item_b_id=b_id,
+            scope_same=True,
+            confidence=min(1.0, confidence),
+            rationale=rationale,
+            critical_blue=False,
+        )
+
+    # Ensure every A item still has one pair.
+    pairs: list[ProposedPair] = []
+    for a in items_a:
+        a_id = int(a["id"])
+        pair = best.get(a_id)
+        if pair is not None:
+            pairs.append(pair)
+            continue
+        pairs.append(
+            ProposedPair(
+                item_a_id=a_id,
+                item_b_id=None,
+                scope_same=False,
+                confidence=0.0,
+                rationale="no candidate selected",
+                critical_blue=False,
+            )
+        )
+
+    return MatchPlan(pairs=pairs)
 
 
 def _to_brief_items(items: list[dict[str, Any]], max_len: int = 180) -> list[dict[str, Any]]:
@@ -152,8 +402,13 @@ def _call_match_plan(
         "room_b": room_b,
         "items_a": _to_brief_items(items_a),
         "items_b": _to_brief_items(items_b),
-        "instructions": "Return a MatchPlan with one ProposedPair for each items_a entry.",
+        "instructions": (
+            "Return a MatchPlan with one ProposedPair for each items_a entry. "
+            "Process each item_a_id individually in order, and use exact_name_candidates_by_a / "
+            "near_name_candidates_by_a before falling back to full-room comparison."
+        ),
     }
+    user.update(_build_name_match_hints(items_a, items_b))
     if extra_user_fields:
         user.update(extra_user_fields)
 
@@ -212,7 +467,7 @@ def propose_matches_for_room(
     model: str | None = None,
 ) -> MatchPlan:
     chosen_model = model or settings.matching_first_pass_model
-    return _call_match_plan(
+    plan = _call_match_plan(
         model=chosen_model,
         room_a=room_a,
         room_b=room_b,
@@ -220,6 +475,7 @@ def propose_matches_for_room(
         items_b=items_b,
         system_prompt=SYSTEM_PROMPT,
     )
+    return _enforce_exact_wording_matches(plan, items_a=items_a, items_b=items_b)
 
 
 def propose_matches_for_room_ensemble(
@@ -280,4 +536,5 @@ def propose_matches_for_room_ensemble(
         fallback = propose_matches_for_room(room_a, room_b, items_a, items_b)
         return MatchPlan(pairs=list(_best_pairs_by_a(fallback).values()))
 
+    reviewer_plan = _enforce_exact_wording_matches(reviewer_plan, items_a=items_a, items_b=items_b)
     return MatchPlan(pairs=list(_best_pairs_by_a(reviewer_plan).values()))

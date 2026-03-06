@@ -1,3 +1,5 @@
+"""SQLAlchemy model for uploaded run metadata and source proposal paths."""
+
 import uuid
 from datetime import datetime
 from sqlalchemy import String, DateTime
