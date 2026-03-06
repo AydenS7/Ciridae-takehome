@@ -346,6 +346,60 @@ def _status_note_color_array(status: str) -> ArrayObject:
     return ArrayObject([FloatObject(rgb[0] / 255), FloatObject(rgb[1] / 255), FloatObject(rgb[2] / 255)])
 
 
+# --- DEBUG: room-based highlight colors ---
+_ROOM_COLOR_PALETTE = [
+    "93c5fd",  # blue
+    "86efac",  # green
+    "fde68a",  # yellow
+    "fdba74",  # orange
+    "c4b5fd",  # purple
+    "f9a8d4",  # pink
+    "6ee7b7",  # teal
+    "fca5a5",  # red
+    "d9f99d",  # lime
+    "a5f3fc",  # cyan
+]
+
+_ROOM_KEYWORD_COLORS: dict[str, str] = {
+    "bathroom": "93c5fd",   # blue
+    "bath":     "93c5fd",
+    "bedroom":  "86efac",   # green
+    "bed":      "86efac",
+    "hallway":  "fde68a",   # yellow
+    "hall":     "fde68a",
+    "kitchen":  "fdba74",   # orange
+    "living":   "c4b5fd",   # purple
+    "dining":   "f9a8d4",   # pink
+    "garage":   "d1d5db",   # gray
+    "basement": "d4a574",   # brown
+    "office":   "6ee7b7",   # teal
+    "laundry":  "ddd6fe",   # lavender
+    "exterior": "fca5a5",   # red
+    "stair":    "d9f99d",   # lime
+    "attic":    "a5f3fc",   # cyan
+}
+
+_room_color_cache: dict[str, str] = {}
+_room_color_counter: list[int] = [0]
+
+
+def _room_highlight_color(room_name: str) -> str:
+    """Return a stable hex highlight color for a room name (debug mode)."""
+    key = (room_name or "").strip().lower()
+    if key in _room_color_cache:
+        return _room_color_cache[key]
+    for keyword, color in _ROOM_KEYWORD_COLORS.items():
+        if keyword in key:
+            _room_color_cache[key] = color
+            return color
+    # Assign next palette color for unknown rooms
+    idx = _room_color_counter[0] % len(_ROOM_COLOR_PALETTE)
+    color = _ROOM_COLOR_PALETTE[idx]
+    _room_color_counter[0] += 1
+    _room_color_cache[key] = color
+    return color
+
+
 def _nugget_line(row: dict) -> str:
     room_b = _cut(row.get("room_b", ""), 36)
     b_desc = _cut(row.get("b_desc", ""), 90)
@@ -447,6 +501,8 @@ def render_report_pdf(
     }
     with pdfplumber.open(str(src)) as plumber_pdf:
         for row in rows_sorted:
+            # --- DEBUG: room-based highlighting ---
+            # Only annotate Doc A items (skip nuggets which have no a_page)
             status = (row.get("status") or "").lower()
             if status not in {"green", "orange", "blue"}:
                 continue
@@ -470,83 +526,126 @@ def render_report_pdf(
             render_stats["line_items_targeted"] += 1
             rect = _find_match_rect(page, row.get("a_desc", ""), used_rects)
             if rect is None:
-                comment = _comment_for_row(row)
-                page_obj = writer.pages[page_number - 1]
-                page_width = float(page_obj.mediabox.width)
-                page_height = float(page_obj.mediabox.height)
-                room_anchor_rect = _find_room_anchor_rect(page, str(row.get("room_a") or ""))
-                if room_anchor_rect is not None:
-                    note_rect = _note_rect_near_line(room_anchor_rect, page_width, page_height, note_size=14.0, gap=4.0)
-                    render_stats["anchored_room_notes_added"] += 1
-                else:
-                    fallback_idx = fallback_note_count_by_page.get(page_number, 0)
-                    note_rect = _fallback_note_rect(page_width, page_height, fallback_idx)
-                    fallback_note_count_by_page[page_number] = fallback_idx + 1
-                note = Text(
-                    rect=note_rect,
-                    text=comment,
-                    open=False,
-                    title_bar="Ciridae",
-                )
-                note[NameObject("/Subj")] = TextStringObject(f"{status.upper()}_UNLOCATED")
-                note[NameObject("/C")] = _status_note_color_array(status)
-                writer.add_annotation(page_number - 1, note)
-                popup = Popup(
-                    rect=(
-                        max(8.0, note_rect[0] - 12.0),
-                        max(8.0, note_rect[1] - 8.0),
-                        max(220.0, min(page_width - 8.0, note_rect[0] + 300.0)),
-                        max(150.0, min(page_height - 8.0, note_rect[1] + 170.0)),
-                    ),
-                    parent=note,
-                    open=False,
-                )
-                writer.add_annotation(page_number - 1, popup)
                 render_stats["unlocated_notes_added"] += 1
                 continue
 
             used_rects.append(rect)
-
-            comment = _comment_for_row(row)
+            room_color = _room_highlight_color(row.get("room_a", ""))
             quad_points = _quad_points_for_rect(rect)
+            room_label = (row.get("room_a") or "unknown room").strip()
             highlight = Highlight(
                 rect=rect,
                 quad_points=quad_points,
-                highlight_color=_status_highlight_color(status),
+                highlight_color=room_color,
             )
-            highlight[NameObject("/Contents")] = TextStringObject(comment)
+            highlight[NameObject("/Contents")] = TextStringObject(room_label)
             highlight[NameObject("/T")] = TextStringObject("Ciridae")
-            highlight[NameObject("/Subj")] = TextStringObject(status.upper())
+            highlight[NameObject("/Subj")] = TextStringObject(f"ROOM:{room_label}")
             writer.add_annotation(page_number - 1, highlight)
             render_stats["highlights_added"] += 1
 
-            # Add a visible comment-note icon next to the matched line.
-            page_obj = writer.pages[page_number - 1]
-            page_width = float(page_obj.mediabox.width)
-            page_height = float(page_obj.mediabox.height)
-            note_rect = _note_rect_near_line(rect, page_width, page_height)
-            note = Text(
-                rect=note_rect,
-                text=comment,
-                open=False,
-                title_bar="Ciridae",
-            )
-            note[NameObject("/Subj")] = TextStringObject(status.upper())
-            note[NameObject("/C")] = _status_note_color_array(status)
-            writer.add_annotation(page_number - 1, note)
-            popup_rect = (
-                max(8.0, min(note_rect[2] + 8.0, page_width - 280.0)),
-                max(8.0, min(note_rect[1] - 8.0, page_height - 180.0)),
-                max(220.0, min(note_rect[2] + 280.0, page_width - 8.0)),
-                max(150.0, min(note_rect[1] + 150.0, page_height - 8.0)),
-            )
-            popup = Popup(
-                rect=popup_rect,
-                parent=note,
-                open=False,
-            )
-            writer.add_annotation(page_number - 1, popup)
-            render_stats["inline_notes_added"] += 1
+        # --- STATUS-BASED HIGHLIGHTING (commented out for debug) ---
+        # for row in rows_sorted:
+        #     status = (row.get("status") or "").lower()
+        #     if status not in {"green", "orange", "blue"}:
+        #         continue
+        #
+        #     a_item_id = row.get("a_item_id")
+        #     if isinstance(a_item_id, int):
+        #         if a_item_id in seen_a_item_ids:
+        #             continue
+        #         seen_a_item_ids.add(a_item_id)
+        #
+        #     page_number = row.get("a_page")
+        #     if not isinstance(page_number, int):
+        #         continue
+        #     if page_number <= 0 or page_number > len(writer.pages):
+        #         continue
+        #     if page_number > len(plumber_pdf.pages):
+        #         continue
+        #
+        #     page = plumber_pdf.pages[page_number - 1]
+        #     used_rects = used_rects_by_page.setdefault(page_number, [])
+        #     render_stats["line_items_targeted"] += 1
+        #     rect = _find_match_rect(page, row.get("a_desc", ""), used_rects)
+        #     if rect is None:
+        #         comment = _comment_for_row(row)
+        #         page_obj = writer.pages[page_number - 1]
+        #         page_width = float(page_obj.mediabox.width)
+        #         page_height = float(page_obj.mediabox.height)
+        #         room_anchor_rect = _find_room_anchor_rect(page, str(row.get("room_a") or ""))
+        #         if room_anchor_rect is not None:
+        #             note_rect = _note_rect_near_line(room_anchor_rect, page_width, page_height, note_size=14.0, gap=4.0)
+        #             render_stats["anchored_room_notes_added"] += 1
+        #         else:
+        #             fallback_idx = fallback_note_count_by_page.get(page_number, 0)
+        #             note_rect = _fallback_note_rect(page_width, page_height, fallback_idx)
+        #             fallback_note_count_by_page[page_number] = fallback_idx + 1
+        #         note = Text(
+        #             rect=note_rect,
+        #             text=comment,
+        #             open=False,
+        #             title_bar="Ciridae",
+        #         )
+        #         note[NameObject("/Subj")] = TextStringObject(f"{status.upper()}_UNLOCATED")
+        #         note[NameObject("/C")] = _status_note_color_array(status)
+        #         writer.add_annotation(page_number - 1, note)
+        #         popup = Popup(
+        #             rect=(
+        #                 max(8.0, note_rect[0] - 12.0),
+        #                 max(8.0, note_rect[1] - 8.0),
+        #                 max(220.0, min(page_width - 8.0, note_rect[0] + 300.0)),
+        #                 max(150.0, min(page_height - 8.0, note_rect[1] + 170.0)),
+        #             ),
+        #             parent=note,
+        #             open=False,
+        #         )
+        #         writer.add_annotation(page_number - 1, popup)
+        #         render_stats["unlocated_notes_added"] += 1
+        #         continue
+        #
+        #     used_rects.append(rect)
+        #
+        #     comment = _comment_for_row(row)
+        #     quad_points = _quad_points_for_rect(rect)
+        #     highlight = Highlight(
+        #         rect=rect,
+        #         quad_points=quad_points,
+        #         highlight_color=_status_highlight_color(status),
+        #     )
+        #     highlight[NameObject("/Contents")] = TextStringObject(comment)
+        #     highlight[NameObject("/T")] = TextStringObject("Ciridae")
+        #     highlight[NameObject("/Subj")] = TextStringObject(status.upper())
+        #     writer.add_annotation(page_number - 1, highlight)
+        #     render_stats["highlights_added"] += 1
+        #
+        #     # Add a visible comment-note icon next to the matched line.
+        #     page_obj = writer.pages[page_number - 1]
+        #     page_width = float(page_obj.mediabox.width)
+        #     page_height = float(page_obj.mediabox.height)
+        #     note_rect = _note_rect_near_line(rect, page_width, page_height)
+        #     note = Text(
+        #         rect=note_rect,
+        #         text=comment,
+        #         open=False,
+        #         title_bar="Ciridae",
+        #     )
+        #     note[NameObject("/Subj")] = TextStringObject(status.upper())
+        #     note[NameObject("/C")] = _status_note_color_array(status)
+        #     writer.add_annotation(page_number - 1, note)
+        #     popup_rect = (
+        #         max(8.0, min(note_rect[2] + 8.0, page_width - 280.0)),
+        #         max(8.0, min(note_rect[1] - 8.0, page_height - 180.0)),
+        #         max(220.0, min(note_rect[2] + 280.0, page_width - 8.0)),
+        #         max(150.0, min(note_rect[1] + 150.0, page_height - 8.0)),
+        #     )
+        #     popup = Popup(
+        #         rect=popup_rect,
+        #         parent=note,
+        #         open=False,
+        #     )
+        #     writer.add_annotation(page_number - 1, popup)
+        #     render_stats["inline_notes_added"] += 1
 
         # Add nugget summary notes only on page 1 to avoid random notes scattered across many pages.
         nugget_rows: list[dict] = []
@@ -612,18 +711,7 @@ def render_report_pdf(
                 )
                 writer.add_annotation(page_number - 1, popup)
 
-        # Append a dedicated summary page with nuggets table.
-        summary_pdf_bytes = _build_summary_page(rows_sorted, summary)
-        if summary_pdf_bytes:
-            try:
-                extra_reader = PdfReader(io.BytesIO(summary_pdf_bytes))
-                for pg in extra_reader.pages:
-                    writer.add_page(pg)
-                render_stats["summary_page_appended"] = True
-            except Exception:
-                render_stats["summary_page_appended"] = False
-        else:
-            render_stats["summary_page_appended"] = False
+        render_stats["summary_page_appended"] = False
 
     with out.open("wb") as f:
         writer.write(f)

@@ -13,72 +13,45 @@ from .llm_match_schemas import MatchPlan, ProposedPair
 from .llm_utils import expand_model_variants, normalize_model_list
 from .settings import settings
 
-SYSTEM_PROMPT = """You are matching line items between two repair estimates within the SAME room/area.
+SYSTEM_PROMPT = """You match JDR (contractor, Doc A) line items to Insurance (Doc B) line items within the SAME room.
 
-Item format note:
-- Contractor (Doc A) items typically begin with a number and period, e.g. "1. Remove and replace drywall".
-  Use this leading number to uniquely identify and reference each item.
-- EVERY A item in the input MUST produce exactly one ProposedPair in the output — no exceptions, no omissions.
-  If you finish and your output count does not match the number of A items provided, you have missed items — go back and add them.
+ACCURACY IS CRITICAL. Wrong matches (misidentifying which B item goes with an A item) cause incorrect green/orange/blue labels in the final report. Take your time. Be precise.
 
-Goal:
-- For each contractor item (Doc A), return exactly one ProposedPair.
-- One-to-one: each B item can be used at most once.
-- STRONGLY prefer matching over null.
+Item format: Doc A items typically start with "N." e.g. "1. Remove and replace drywall". Use this number to identify each item.
 
-You must process each A item individually using this checklist:
-1) Check exact_name_candidates_by_a[item_a_id]. If present, evaluate those first.
-2) Check near_name_candidates_by_a[item_a_id]. If present, evaluate those next.
-3) If no exact wording match exists, compare against remaining room-scoped B items for best same-task match.
-4) Return null ONLY when no B item in the room plausibly describes the same underlying work.
+For EVERY A item, output exactly one ProposedPair — no omissions. Count your output before finishing.
 
-Rules:
-- Exact wording matches in same room should almost always be matched (not blue).
-- If multiple exact wording matches exist, choose the one with best metadata alignment (amount, quantity, unit, unit_price).
-- After exact wording, use semantic same-task matching as fallback; do not force null just because wording differs.
-- Do not skip items; emit one pair for every A id.
-- Metadata drives green vs orange downstream:
-  - green requires scope match + key metadata within ±2%
-  - orange is scope match but metadata differs beyond ±2%
-  Therefore, when selecting among plausible B candidates, prefer the candidate with closest metadata alignment.
-- If matched and work is same task, set scope_same=true.
-- Set scope_same=false only when matched but genuinely uncertain.
-- Rationale must mention which checklist step decided the match (exact-wording / near-wording / semantic-fallback / true-unmatched)
-  and briefly mention metadata alignment quality.
+Matching rules — follow in order:
+1. Check exact_name_candidates_by_a[item_a_id] first — if present, that IS the match. Do not second-guess it.
+2. Check near_name_candidates_by_a[item_a_id] next — close name = confirmed match.
+3. If no candidates, find the closest-named B item in the room for the same underlying task.
+4. Return null ONLY when the task genuinely does not appear in B for this room. Do NOT return null just because wording differs slightly — use semantic judgment.
 
-For unmatched A items (item_b_id=null): set critical_blue=true if this item is high-priority scope
-(electrical/safety testing, permits, code compliance, hazards, engineering/inspection, liability-critical work).
+scope_same:
+- true  → same underlying repair task (use whenever names are close or candidates exist)
+- false → matched but genuinely uncertain — use sparingly, only for truly ambiguous wording
+
+One-to-one: each B item may be used at most once. If two A items want the same B item, assign it to the closer name match and find the next best for the other.
+
+For null matches: set critical_blue=true if the item is high-priority scope
+(permits, electrical, safety testing, code compliance, hazards, engineering, liability-critical work).
 """
 
-REVIEWER_SYSTEM_PROMPT = """You are a second-pass reviewer for uncertain line-item matches.
+REVIEWER_SYSTEM_PROMPT = """You review uncertain first-pass matches between JDR (Doc A) and Insurance (Doc B) line items.
 
-You receive room-scoped A/B items plus first-pass decisions.
+ACCURACY IS CRITICAL. A wrong match is worse than a missed match. Review carefully.
 
-Item format note:
-- Contractor (Doc A) items typically begin with a number and period, e.g. "3. Seal and prime walls".
-  Use this leading number to uniquely identify each item and ensure none are missed.
-- EVERY uncertain A item passed to you MUST produce exactly one ProposedPair in your output.
-  Count the input items and verify your output count matches before finishing.
-
-Reviewer checklist for each uncertain A item:
-1) Re-check exact_name_candidates_by_a[item_a_id].
-2) Re-check near_name_candidates_by_a[item_a_id].
-3) Validate/override first-pass decision using same-room best match.
-4) Keep null only if truly no plausible same-task B item exists.
+For every uncertain A item, output exactly one ProposedPair. Count your output before finishing.
 
 Rules:
-- STRONGLY prefer matching over null.
-- If first pass returned null but exact same-name candidate exists, override null unless clearly wrong.
-- If multiple candidates exist, pick the one with strongest wording alignment, then best metadata alignment.
-- If no exact wording match exists, use semantic same-task fallback rather than overusing null.
-- If matched and same task, set scope_same=true.
-- Set scope_same=false only when matched but uncertain.
-- Rationale must explicitly state why you confirmed/overrode first pass and which checklist step was used.
-- Remember: downstream status is metadata-based (green within ±2%, orange otherwise), so prefer candidates
-  whose metadata is closest when scope is comparable.
+- If exact or near-name candidate exists, match it — the name IS the ground truth.
+- Return null only when no B item in the room plausibly covers the same task — not just because wording differs.
+- scope_same=true when same task; scope_same=false only when the description is genuinely ambiguous.
+- Override first-pass null if a name candidate exists. Override first-pass match only if it's clearly wrong.
+- One sentence rationale: why you confirmed or overrode the first pass.
 
-For unmatched A items (item_b_id=null): set critical_blue=true for high-priority omitted scope
-(electrical/safety testing, permits, code compliance, hazards, engineering/inspection, liability-critical work).
+For null matches: set critical_blue=true for high-priority omitted scope
+(permits, electrical, safety testing, code compliance, hazards, engineering, liability-critical work).
 """
 
 _TOKEN_RE = re.compile(r"[a-z0-9']+")

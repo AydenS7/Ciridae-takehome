@@ -33,8 +33,8 @@ class Settings(BaseSettings):
     matching_fallback_similarity_threshold: float = 0.28
     matching_reconcile_similarity_threshold: float = 0.34
     matching_reconcile_scope_similarity_threshold: float = 0.44
-    matching_scope_similarity_threshold: float = 0.40
-    matching_scope_overlap_threshold: float = 0.52
+    matching_scope_similarity_threshold: float = 0.34
+    matching_scope_overlap_threshold: float = 0.44
     matching_assignment_unmatched_threshold: float = 0.28
     matching_blue_guard_unused_threshold: float = 0.30
     matching_blue_guard_consumed_threshold: float = 0.38

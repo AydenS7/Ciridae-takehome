@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import base64
 import re
-from collections import Counter
+from collections import Counter, defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Literal
 
@@ -35,8 +35,17 @@ TEXT_SYSTEM_PROMPT = """You extract ALL estimate line items from insurance/contr
 ITEM BOUNDARY RULE (most important):
 - A new line item ALWAYS starts with a number followed by a period at the LEFT margin, e.g. "1.", "2.", "15."
 - If a line does NOT start with "N.", it is a CONTINUATION of the previous item's description — NOT a new item.
-- Concatenate continuation lines into the description of the item they belong to.
+- Concatenate continuation lines (text portion only) into the description of the item they belong to.
 - Extract items in sequential order: 1, 2, 3, … up to the last number on the page. Do NOT skip any number.
+
+INLINE METADATA RULE:
+- The first line of an item often contains the description text followed by metadata columns inline, e.g.:
+    "71. Door hinges (set of 3) and slab - 1.00 EA 0.00 29.94 0.00 5.98 35.92"
+  Here "71. Door hinges (set of 3) and slab" is the description; "1.00 EA … 35.92" is metadata (qty/unit/prices).
+- Continuation lines that follow (no leading number) add more description text. They may also contain inline metadata — extract the text portion and append it to the description. Example:
+    "Detach & reset"                                          → append to description
+    "Door hinges will need to be detached and reset …"       → append to description
+  Full description becomes: "71. Door hinges (set of 3) and slab Detach & reset Door hinges will need to be detached and reset to allow replacement of jamb"
 
 PROCESS — follow these steps in order:
 1. Read the text top-to-bottom and identify every section/room heading (e.g. "Kitchen", "Master Bedroom", "Interior").
@@ -60,9 +69,17 @@ VISION_SYSTEM_PROMPT = """You extract EVERY billable line item from an insurance
 
 ITEM BOUNDARY RULE (most important):
 - A new line item ALWAYS starts with a number followed by a period at the LEFT margin of the page, e.g. "1.", "2.", "15."
-- If a row does NOT start with "N." at the left, it is a CONTINUATION of the previous item's description — NOT a new item. Append it to the previous item's description.
+- If a row does NOT start with "N." at the left, it is a CONTINUATION of the previous item's description — NOT a new item. Append its text to the previous item's description.
 - Extract items in sequential numerical order: 1, 2, 3, … to the last number visible. Do NOT skip any number.
 - After extracting, count: is there one entry for every number from the first to the last on this page? If not, go back and add the missing ones.
+
+INLINE METADATA RULE:
+- An item's first line often has the description text followed by metadata columns on the same line, e.g.:
+    "71. Door hinges (set of 3) and slab - 1.00 EA 0.00 29.94 0.00 5.98 35.92"
+  Description = "71. Door hinges (set of 3) and slab"; metadata = qty 1.00, unit EA, total 35.92.
+- Continuation rows (no leading number) that follow contribute MORE description text. Example:
+    "Detach & reset"  and  "Door hinges will need to be detached and reset to allow replacement of jamb"
+  are both continuations — append them. Full description: "71. Door hinges (set of 3) and slab Detach & reset Door hinges will need to be detached and reset to allow replacement of jamb"
 
 PROCESS — follow these steps in order:
 1. SCAN the full image top-to-bottom and note every section/room heading and its vertical position.
@@ -155,6 +172,9 @@ def _has_meaningful_description(text: str) -> bool:
 
 
 _ITEM_LINE_RE = re.compile(r"^\s*(\d{1,4})\s*[\.\)]\s+")
+# Matches JDR "Totals: Kitchen" / "Total - Master Bedroom" style end-of-section markers.
+# Room name must start with a letter so we don't match "Total: $1,234.56".
+_TOTALS_LINE_RE = re.compile(r"^\s*totals?\s*[:\-]?\s*([a-zA-Z].+)$", re.IGNORECASE)
 _TABLE_HEADER_RE = re.compile(r"\b(description|qty|quantity|reset|remove|replace|tax|o&p|total|unit price|price)\b", re.IGNORECASE)
 _NON_ROOM_HEADER_RE = re.compile(
     r"\b(subtotal|total|estimate|claim|policy|date|page|continued|deductible|overhead|profit)\b",
@@ -252,6 +272,113 @@ def _reassign_rooms_by_heading_map(page_text: str, items: list[ExtractedItem]) -
         else:
             out.append(it)
     return out, changed
+
+
+def _parse_doc_item_rooms(page_texts: list[tuple[int, str]]) -> list[tuple[int, int, str]]:
+    """
+    Document-level room assignment for JDR-style estimates where:
+      - Items are numbered starting at 1 for each room section
+      - Each section ENDS with a line like "Totals:  Kitchen" or "Totals - Master Bedroom"
+
+    Reads all page texts sequentially. Accumulates (page, item_num) pairs in a pending
+    list. When a "Totals: [Room Name]" line is found, assigns that room to all pending
+    items (which may span multiple pages).
+
+    Returns: [(page_num, item_num, room_name), ...] in document order.
+    """
+    pending: list[tuple[int, int]] = []
+    assignments: list[tuple[int, int, str]] = []
+
+    for page_num, text in sorted(page_texts, key=lambda x: x[0]):
+        for raw_line in (text or "").splitlines():
+            line = re.sub(r"\s+", " ", raw_line.strip())
+            if not line:
+                continue
+
+            totals_m = _TOTALS_LINE_RE.match(line)
+            if totals_m:
+                room_name = re.sub(r"\s+", " ", totals_m.group(1)).strip()
+                # Strip trailing "continued" qualifier
+                room_name = re.sub(r"\s*-?\s*continued\s*$", "", room_name, flags=re.IGNORECASE).strip()
+                if room_name:
+                    for p, n in pending:
+                        assignments.append((p, n, room_name))
+                    pending = []
+                continue
+
+            item_m = _ITEM_LINE_RE.match(line)
+            if item_m:
+                item_num = int(item_m.group(1))
+                pending.append((page_num, item_num))
+
+    # Any remaining pending items have no Totals — leave for LLM-assigned rooms
+    return assignments
+
+
+def _reassign_rooms_doc_level(
+    doc_assignments: list[tuple[int, int, str]],
+    all_results: list["ExtractPageResult"],
+) -> tuple[list["ExtractPageResult"], int]:
+    """
+    After all LLM extractions, correct item rooms using document-level Totals-boundary map.
+    Handles item number restarts across room sections on the same page.
+
+    Returns (updated_results, total_changes).
+    """
+    if not doc_assignments:
+        return all_results, 0
+
+    # Build per-page ordered queue of (item_num, room) pairs in doc order
+    page_queues: dict[int, deque[tuple[int, str]]] = defaultdict(deque)
+    for page_num, item_num, room in doc_assignments:
+        page_queues[page_num].append((item_num, room))
+
+    updated: list["ExtractPageResult"] = []
+    total_changes = 0
+
+    for result in all_results:
+        page_num = int(result.page)
+        if page_num not in page_queues or not page_queues[page_num]:
+            updated.append(result)
+            continue
+
+        # Work through items in item-number order (document order within page)
+        remaining = list(page_queues[page_num])
+        items_by_order = sorted(
+            result.items,
+            key=lambda it: _item_number_from_description(it.description or "") or 9999,
+        )
+
+        new_items: list[ExtractedItem] = []
+        for it in items_by_order:
+            item_num = _item_number_from_description(it.description or "")
+            if item_num is None:
+                new_items.append(it)
+                continue
+            # Find and consume the first matching entry in remaining
+            matched_room: str | None = None
+            for i, (q_num, q_room) in enumerate(remaining):
+                if q_num == item_num:
+                    matched_room = q_room
+                    remaining.pop(i)
+                    break
+            if matched_room and matched_room != (it.room or "").strip():
+                new_items.append(ExtractedItem(
+                    room=matched_room,
+                    description=it.description,
+                    quantity=it.quantity,
+                    unit=it.unit,
+                    unit_price=it.unit_price,
+                    total=it.total,
+                    confidence=it.confidence,
+                ))
+                total_changes += 1
+            else:
+                new_items.append(it)
+
+        updated.append(ExtractPageResult(doc=result.doc, page=result.page, items=new_items))
+
+    return updated, total_changes
 
 
 def _sanitize_items(items: list[ExtractedItem]) -> list[ExtractedItem]:
@@ -571,6 +698,11 @@ def extract_pdf_via_llm(pdf_path: str, doc: Doc) -> tuple[list[ExtractPageResult
             pages_processed += 1
             candidate_pages.append((page_index, text))
 
+    # Document-level room map: "Totals: [Room]" boundaries tell us which room each item
+    # belongs to. This is built from raw page text BEFORE LLM extraction so it works even
+    # when items and their "Totals:" line are on different pages.
+    doc_item_rooms = _parse_doc_item_rooms(candidate_pages)
+
     results: list[ExtractPageResult] = []
     if candidate_pages:
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
@@ -602,7 +734,15 @@ def extract_pdf_via_llm(pdf_path: str, doc: Doc) -> tuple[list[ExtractPageResult
                 room_reassignments_total += int(page_stats.get("room_reassignments", 0))
                 for model_name, count in (page_stats.get("model_usage") or {}).items():
                     model_usage[str(model_name)] += int(count)
-            results = sorted(page_results, key=lambda r: int(r.page))
+            page_results = sorted(page_results, key=lambda r: int(r.page))
+
+        # Apply document-level Totals-boundary room correction AFTER all pages extracted.
+        # This overrides LLM-assigned rooms with the authoritative "Totals: Room" markers.
+        if doc_item_rooms:
+            page_results, doc_level_changes = _reassign_rooms_doc_level(doc_item_rooms, page_results)
+            room_reassignments_total += doc_level_changes
+
+        results = page_results
 
     return results, {
         "doc": doc,

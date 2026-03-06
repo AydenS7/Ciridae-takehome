@@ -21,7 +21,6 @@ from .matching_llm import (
     get_match_telemetry,
     propose_matches_for_room,
     propose_matches_for_room_ensemble,
-    reset_match_telemetry,
 )
 from .settings import settings
 
@@ -505,6 +504,27 @@ def _choice_quality(
     return score
 
 
+def _any_number_match(a_item: LineItem, b_item: LineItem, tol: float) -> bool:
+    """
+    Count how many numeric values from A cross-match numeric values from B within tolerance.
+    Each A value and B value can only be used once (greedy best-first).
+    Fields compared: amount, unit_price, quantity — any combination counts.
+    Returns the number of matched pairs.
+    """
+    a_vals = [v for v in (a_item.amount, a_item.unit_price, a_item.quantity) if v is not None and v > 0]
+    b_vals = [v for v in (b_item.amount, b_item.unit_price, b_item.quantity) if v is not None and v > 0]
+    used_b: set[int] = set()
+    matches = 0
+    # Try each A value against all unused B values; take first match found.
+    for av in a_vals:
+        for bi, bv in enumerate(b_vals):
+            if bi not in used_b and _pct_diff(av, bv) <= tol:
+                used_b.add(bi)
+                matches += 1
+                break
+    return matches
+
+
 def _metadata_tolerance_result(
     a_item: LineItem,
     b_item: LineItem,
@@ -513,38 +533,24 @@ def _metadata_tolerance_result(
 ) -> tuple[bool, bool, list[str]]:
     """
     Returns:
-    - metadata_within_tol: all key fields are aligned within tolerance
-    - amount_within_tol: total/amount exists on both and is within tolerance
-    - mismatch_fields: key fields outside tolerance or missing on one side
+    - metadata_within_tol: 3+ numeric cross-matches found (green threshold)
+    - amount_within_tol: same as metadata_within_tol (kept for compatibility)
+    - mismatch_fields: informational — fields present on both sides that differ beyond tol
     """
+    match_count = _any_number_match(a_item, b_item, tol)
+    green = match_count >= 3
+
+    # Informational mismatch list for rationale string only.
     mismatch_fields: list[str] = []
-
-    def _check_numeric(name: str, a_val: float | None, b_val: float | None) -> None:
-        if a_val is None and b_val is None:
-            return
-        if (a_val is None) != (b_val is None):
-            mismatch_fields.append(name)
-            return
-        if _pct_diff(a_val, b_val) > tol:
+    for name, av, bv in [
+        ("amount", a_item.amount, b_item.amount),
+        ("quantity", a_item.quantity, b_item.quantity),
+        ("unit_price", a_item.unit_price, b_item.unit_price),
+    ]:
+        if av is not None and bv is not None and _pct_diff(av, bv) > tol:
             mismatch_fields.append(name)
 
-    _check_numeric("amount", a_item.amount, b_item.amount)
-    _check_numeric("quantity", a_item.quantity, b_item.quantity)
-    _check_numeric("unit_price", a_item.unit_price, b_item.unit_price)
-
-    a_unit = _canonical_unit(a_item.unit)
-    b_unit = _canonical_unit(b_item.unit)
-    if a_unit or b_unit:
-        if not a_unit or not b_unit or a_unit != b_unit:
-            mismatch_fields.append("unit")
-
-    metadata_within_tol = len(mismatch_fields) == 0
-    amount_within_tol = (
-        a_item.amount is not None
-        and b_item.amount is not None
-        and _pct_diff(a_item.amount, b_item.amount) <= tol
-    )
-    return metadata_within_tol, amount_within_tol, mismatch_fields
+    return green, green, mismatch_fields
 
 
 def _nugget_signature(room_b: str, description: str, amount: float | None) -> tuple[str, str, float | None]:
@@ -755,7 +761,7 @@ def _run_llm_for_room(
 
 
 @router.post("/{run_id}/match")
-def match_run(run_id: str, min_room_confidence: float = 0.6, min_pair_confidence: float | None = None):
+def match_run(run_id: str, min_room_confidence: float = 0.6):
     """
     LLM-only pairing per mapped room, deterministic classification:
     - comparisons use semantic name/description + key metadata (amount/quantity/unit/unit_price)
@@ -765,28 +771,12 @@ def match_run(run_id: str, min_room_confidence: float = 0.6, min_pair_confidence
     - nugget: insurance-only (B present with no matched A)
     """
     t0 = perf_counter()
-    reset_match_telemetry()
     with SessionLocal() as db:
-        effective_min_pair_conf = (
-            settings.matching_accept_confidence if min_pair_confidence is None else float(min_pair_confidence)
-        )
         first_pass_unsure_conf = float(settings.matching_first_pass_unsure_confidence)
         first_pass_unsure_null_conf = float(settings.matching_first_pass_unsure_null_confidence)
         first_pass_scope_unsure_conf = float(settings.matching_first_pass_scope_unsure_confidence)
         force_review_on_null = bool(settings.matching_force_review_on_null)
         green_amount_tol = float(settings.matching_green_amount_tolerance_pct)
-        fallback_min_score = float(settings.matching_fallback_similarity_threshold)
-        reconcile_min_score = float(settings.matching_reconcile_similarity_threshold)
-        reconcile_scope_desc_sim = float(settings.matching_reconcile_scope_similarity_threshold)
-        scope_sim_threshold = float(settings.matching_scope_similarity_threshold)
-        scope_overlap_threshold = float(settings.matching_scope_overlap_threshold)
-        assignment_unmatched_threshold = float(settings.matching_assignment_unmatched_threshold)
-        blue_guard_unused_threshold = float(settings.matching_blue_guard_unused_threshold)
-        blue_guard_consumed_threshold = float(settings.matching_blue_guard_consumed_threshold)
-        rescue_green_price_tol = float(settings.rescue_green_price_tol)
-        rescue_orange_price_tol = float(settings.rescue_orange_price_tol)
-        rescue_min_desc_sim_green = float(settings.rescue_min_desc_sim_green)
-        rescue_min_desc_sim_orange = float(settings.rescue_min_desc_sim_orange)
 
         run = db.get(Run, run_id)
         if not run:
@@ -1077,568 +1067,83 @@ def match_run(run_id: str, min_room_confidence: float = 0.6, min_pair_confidence
             second_pass_reviewed_count += llm_result["second_pass_reviewed_count"]
             second_pass_rooms_invoked += llm_result["second_pass_rooms_invoked"]
 
-            # Build one candidate per A item (prefer second-pass decision when available).
-            candidate_for_a: dict[int, dict] = {}
+            # ── Simple greedy one-to-one assignment ──────────────────────────────────
+            # 1. For each A item pick best proposal (second-pass > first-pass).
+            # 2. Sort all proposals by confidence desc and assign greedily —
+            #    first claim on a B item wins; conflicts resolved by confidence.
+            # 3. Classify deterministically: scope_same + metadata ±2%.
+
+            proposals: list[tuple[float, int, int | None, bool, str]] = []
+            # (confidence, a_id, b_id_or_none, scope_same, rationale)
             for a_item in a_items:
                 a_id = a_item.id
-                first_choice = first_best_for_a.get(a_id)
-                second_choice = second_best_for_a.get(a_id)
-                chosen = second_best_for_a.get(a_id) or first_best_for_a.get(a_id)
-                second_overrode_with_null = False
-                chosen_via_quality = False
-                if second_choice is not None and second_choice[0] is None and first_choice is not None and first_choice[0] is not None:
-                    keep_first_candidate = float(first_choice[2]) >= max(0.32, effective_min_pair_conf - 0.05)
-                    if keep_first_candidate:
-                        chosen = first_choice
-                        second_overrode_with_null = True
-                if (
-                    first_choice is not None
-                    and second_choice is not None
-                    and first_choice[0] is not None
-                    and second_choice[0] is not None
-                    and first_choice[0] != second_choice[0]
-                ):
-                    q_first = _choice_quality(
-                        a_item=a_item,
-                        choice=first_choice,
-                        b_by_id=b_by_id,
-                        green_amount_tol=green_amount_tol,
-                        scope_sim_threshold=scope_sim_threshold,
-                        scope_overlap_threshold=scope_overlap_threshold,
-                    )
-                    q_second = _choice_quality(
-                        a_item=a_item,
-                        choice=second_choice,
-                        b_by_id=b_by_id,
-                        green_amount_tol=green_amount_tol,
-                        scope_sim_threshold=scope_sim_threshold,
-                        scope_overlap_threshold=scope_overlap_threshold,
-                    )
-                    if q_first > q_second + 0.05:
-                        chosen = first_choice
-                        chosen_via_quality = True
-                    elif q_second > q_first + 0.05:
-                        chosen = second_choice
-                        chosen_via_quality = True
-                rationales: list[str] = []
-                if room_map_mode != "strong":
-                    mode_reason = {
-                        "low-confidence-fallback": (
-                            "room-map fallback: included lower-confidence mapped room candidates to reduce false blue"
-                        ),
-                        "room-group-fallback": (
-                            "room-group fallback: expanded to B-rooms connected through many-to-many room groups"
-                        ),
-                        "name-profile-fallback": (
-                            "room similarity fallback: selected candidate B-rooms by room-name + room-profile similarity"
-                        ),
-                        "global-room-fallback": (
-                            "global room fallback: mapped room had no B-items; broadened to top similar B-rooms"
-                        ),
-                        "all-rooms-fallback": (
-                            "all-rooms fallback: no reliable mapping candidates; searched across all insurance rooms"
-                        ),
-                        "no-strong-link-fallback": (
-                            "room-map fallback: no strong room links; kept best available candidates"
-                        ),
-                    }.get(
-                        room_map_mode,
-                        "room-map fallback: used alternate room candidates to avoid false blue",
-                    )
-                    rationales.append(mode_reason)
-                if room_alias_expanded:
-                    rationales.append(
-                        "room-alias expansion: included closely related room names from mapped insurance rooms"
-                    )
-                if first_choice is not None:
-                    fp_b, fp_scope, fp_conf, fp_reason = first_choice
-                    fp_core = f"pass1 target={fp_b} conf={fp_conf:.2f} scope_same={bool(fp_scope)}"
-                    if fp_reason:
-                        fp_core = f"{fp_core}: {fp_reason}"
-                    rationales.append(fp_core)
-                if second_choice is not None:
-                    sp_b, sp_scope, sp_conf, sp_reason = second_choice
-                    sp_core = f"pass2-review target={sp_b} conf={sp_conf:.2f} scope_same={bool(sp_scope)}"
-                    if sp_reason:
-                        sp_core = f"{sp_core}: {sp_reason}"
-                    rationales.append(sp_core)
-                if second_overrode_with_null:
-                    rationales.append("pass2 returned null; retained plausible pass1 candidate to avoid false blue")
-                if chosen_via_quality and first_choice is not None and second_choice is not None:
-                    rationales.append(
-                        f"quality arbitration selected target={chosen[0]} over pass1={first_choice[0]} pass2={second_choice[0]}"
-                    )
-
-                if chosen is None:
-                    candidate_for_a[a_id] = {
-                        "item_b_id": None,
-                        "scope_same": False,
-                        "confidence": 0.0,
-                        "source": "none",
-                        "rationales": rationales + ["No model proposal returned for this item."],
-                    }
-                    continue
-                c_b, c_scope, c_conf, c_reason = chosen
-                source = "pass2-ensemble" if a_id in second_best_for_a else "pass1"
-                if c_reason:
-                    rationales.append(f"{source}: {c_reason}".strip(": "))
+                second = second_best_for_a.get(a_id)
+                first  = first_best_for_a.get(a_id)
+                # Prefer second pass; if second pass returned null but first had a confident match, keep first.
+                if second is not None:
+                    b_id, scope_same, conf, rationale = second
+                    if b_id is None and first is not None and first[0] is not None and float(first[2]) >= 0.55:
+                        b_id, scope_same, conf, rationale = first
+                        rationale = f"[kept pass1 over pass2-null] {rationale}"
+                elif first is not None:
+                    b_id, scope_same, conf, rationale = first
                 else:
-                    rationales.append(source)
-                candidate_for_a[a_id] = {
-                    "item_b_id": c_b,
-                    "scope_same": bool(c_scope),
-                    "confidence": float(c_conf),
-                    "source": source,
-                    "rationales": rationales,
-                }
+                    b_id, scope_same, conf, rationale = None, False, 0.0, "no proposal"
+                proposals.append((float(conf), a_id, b_id, bool(scope_same), rationale or ""))
 
-            # Lock very-high-confidence near-exact pairs before global optimization.
-            locked_by_b: dict[int, tuple[float, int]] = {}
-            for a_item in a_items:
-                a_id = a_item.id
-                cand = candidate_for_a.get(a_id)
-                if cand is None:
-                    continue
-                b_id = cand.get("item_b_id")
-                if not isinstance(b_id, int) or b_id not in b_by_id or b_id in globally_used_b_ids:
-                    continue
-                semantic_locked, desc_sim_locked, desc_overlap_locked = _semantic_same(
-                    a_item.description or "",
-                    b_by_id[b_id].description or "",
-                    scope_same_hint=bool(cand.get("scope_same")),
-                    scope_sim_threshold=scope_sim_threshold,
-                    scope_overlap_threshold=scope_overlap_threshold,
-                )
-                if not semantic_locked:
-                    continue
-                conf_locked = float(cand.get("confidence") or 0.0)
-                within_tol_locked = (
-                    _pct_diff(a_item.amount, b_by_id[b_id].amount) <= green_amount_tol
-                    if (a_item.amount is not None and b_by_id[b_id].amount is not None)
-                    else False
-                )
-                if conf_locked < 0.86:
-                    continue
-                if not (within_tol_locked or (desc_sim_locked >= 0.74 and desc_overlap_locked >= 0.78)):
-                    continue
-                lock_score = (
-                    conf_locked
-                    + (0.25 if within_tol_locked else 0.0)
-                    + (0.20 * desc_sim_locked)
-                    + (0.20 * desc_overlap_locked)
-                )
-                prev = locked_by_b.get(b_id)
-                if prev is None or lock_score > prev[0]:
-                    locked_by_b[b_id] = (lock_score, a_id)
-
-            preassigned_for_a: dict[int, dict] = {}
-            prelocked_b_ids: set[int] = set()
-            for b_id, (_, a_id) in locked_by_b.items():
-                cand = candidate_for_a[a_id]
-                preassigned_for_a[a_id] = {
-                    "item_b_id": b_id,
-                    "scope_same": bool(cand.get("scope_same", True)),
-                    "confidence": float(cand.get("confidence") or 0.0),
-                    "rationales": list(cand.get("rationales") or [])
-                    + [f"prelocked high-confidence exact pair B={b_id}"],
-                    "force_status": None,
-                }
-                prelocked_b_ids.add(b_id)
-
-            globally_used_b_ids |= prelocked_b_ids
-
-            # Build multi-candidate score graph per A item, then optimize one-to-one assignment globally.
-            available_b_ids = [b.id for b in b_items if b.id not in globally_used_b_ids]
-            candidate_scores_by_a: dict[int, dict[int, float]] = {}
-            candidate_meta_by_a: dict[int, dict[int, dict[str, float | bool | str]]] = {}
-
-            for a_item in a_items:
-                a_id = a_item.id
-                if a_id in preassigned_for_a:
-                    continue
-                scores_for_a: dict[int, float] = {}
-                meta_for_a: dict[int, dict[str, float | bool | str]] = {}
-                first_choice = first_best_for_a.get(a_id)
-                second_choice = second_best_for_a.get(a_id)
-
-                def add_choice_edge(choice: tuple[int | None, bool, float, str] | None, source_label: str) -> None:
-                    if choice is None:
-                        return
-                    b_id, scope_hint, conf, _ = choice
-                    if b_id is None or b_id not in b_by_id or b_id not in available_b_ids:
-                        return
-                    b_item = b_by_id[b_id]
-                    pair_score, _desc_sim_raw, amt_sim = _pair_similarity(a_item, b_item)
-                    semantic, desc_sim, desc_overlap = _semantic_same(
-                        a_item.description or "",
-                        b_item.description or "",
-                        scope_same_hint=bool(scope_hint),
-                        scope_sim_threshold=scope_sim_threshold,
-                        scope_overlap_threshold=scope_overlap_threshold,
-                    )
-                    within_tol = (
-                        _pct_diff(a_item.amount, b_item.amount) <= green_amount_tol
-                        if (a_item.amount is not None and b_item.amount is not None)
-                        else False
-                    )
-                    edge_score = pair_score + (0.18 if semantic else 0.0) + (0.20 if within_tol else 0.0)
-                    edge_score += min(0.18, 0.10 * float(conf))
-                    edge_score += (0.05 if source_label == "pass2" else 0.03)
-                    edge_score = max(edge_score, 0.0)
-                    prev = scores_for_a.get(b_id)
-                    if prev is None or edge_score > prev:
-                        scores_for_a[b_id] = edge_score
-                        meta_for_a[b_id] = {
-                            "semantic": semantic,
-                            "confidence": max(float(conf), pair_score),
-                            "desc_sim": desc_sim,
-                            "desc_overlap": desc_overlap,
-                            "amount_sim": amt_sim,
-                            "source": source_label,
-                        }
-
-                add_choice_edge(first_choice, "pass1")
-                add_choice_edge(second_choice, "pass2")
-
-                ranked_edges: list[tuple[float, int, bool, float, float, float]] = []
-                for b_id in available_b_ids:
-                    b_item = b_by_id[b_id]
-                    pair_score, desc_sim, amt_sim = _pair_similarity(a_item, b_item)
-                    semantic, _, desc_overlap = _semantic_same(
-                        a_item.description or "",
-                        b_item.description or "",
-                        scope_same_hint=False,
-                        scope_sim_threshold=scope_sim_threshold,
-                        scope_overlap_threshold=scope_overlap_threshold,
-                    )
-                    if pair_score < max(0.26, reconcile_min_score - 0.18) and not semantic:
-                        continue
-                    within_tol = (
-                        _pct_diff(a_item.amount, b_item.amount) <= green_amount_tol
-                        if (a_item.amount is not None and b_item.amount is not None)
-                        else False
-                    )
-                    score = pair_score + (0.15 if semantic else 0.0) + (0.18 if within_tol else 0.0)
-                    ranked_edges.append((score, b_id, semantic, desc_sim, desc_overlap, amt_sim))
-
-                ranked_edges.sort(key=lambda x: x[0], reverse=True)
-                for score, b_id, semantic, desc_sim, desc_overlap, amt_sim in ranked_edges[:8]:
-                    prev = scores_for_a.get(b_id)
-                    if prev is None or score > prev:
-                        scores_for_a[b_id] = score
-                        meta_for_a[b_id] = {
-                            "semantic": semantic,
-                            "confidence": score,
-                            "desc_sim": desc_sim,
-                            "desc_overlap": desc_overlap,
-                            "amount_sim": amt_sim,
-                            "source": "deterministic",
-                        }
-
-                candidate_scores_by_a[a_id] = scores_for_a
-                candidate_meta_by_a[a_id] = meta_for_a
-
-            a_ids_to_optimize = [a.id for a in a_items if a.id not in preassigned_for_a]
-            optimized_assignment = _optimize_room_assignment(
-                a_ids=a_ids_to_optimize,
-                b_ids=available_b_ids,
-                score_by_a=candidate_scores_by_a,
-                unmatched_threshold=max(0.25, min(0.95, assignment_unmatched_threshold)),
-            )
+            # Sort highest confidence first so the best pairs claim B items first.
+            proposals.sort(key=lambda x: x[0], reverse=True)
 
             assigned_for_a: dict[int, dict] = {}
-            for a_item in a_items:
-                a_id = a_item.id
-                if a_id in preassigned_for_a:
-                    assigned_for_a[a_id] = preassigned_for_a[a_id]
-                    continue
-                cand = candidate_for_a[a_id]
-                item_b_id = cand["item_b_id"]
-                confidence = float(cand["confidence"])
-                scope_same = bool(cand["scope_same"])
-                source = str(cand.get("source") or "none")
-                rationales = list(cand["rationales"])
-                force_status: str | None = None
-
-                chosen_b = optimized_assignment.get(a_id)
-                if chosen_b is not None and chosen_b in b_by_id and chosen_b not in globally_used_b_ids:
-                    meta = candidate_meta_by_a.get(a_id, {}).get(chosen_b, {})
-                    if chosen_b == item_b_id:
-                        # Optimizer confirmed LLM's chosen B — trust LLM's scope_same
-                        scope_same = bool(meta.get("semantic", False)) or bool(cand.get("scope_same", False))
-                    else:
-                        # Optimizer picked a different B than LLM suggested — use text-based semantic
-                        scope_same = bool(meta.get("semantic", scope_same))
-                    confidence = max(confidence, float(meta.get("confidence", 0.0)))
-                    rationales.append(
-                        f'global assignment selected B={chosen_b} source={meta.get("source", "unknown")}'
-                    )
-                    globally_used_b_ids.add(chosen_b)
-                else:
-                    chosen_b = None
-                    if (
-                        item_b_id is not None
-                        and item_b_id in b_by_id
-                        and item_b_id not in globally_used_b_ids
-                        and (
-                            confidence >= effective_min_pair_conf
-                            or source == "pass2-ensemble"
-                        )
-                    ):
-                        chosen_b = item_b_id
-                        globally_used_b_ids.add(chosen_b)
-                    else:
-                        if item_b_id is not None and item_b_id in globally_used_b_ids:
-                            rationales.append("candidate B item already used by a higher-confidence pair")
-                        if (
-                            item_b_id is not None
-                            and confidence < effective_min_pair_conf
-                            and source != "pass2-ensemble"
-                        ):
-                            rationales.append("candidate pair confidence below threshold")
-
-                    if chosen_b is None:
-                        # Deterministic fallback prevents weak blue misclassifications.
-                        fb_b, fb_score, fb_reason = _fallback_match(
-                            a_item,
-                            b_items,
-                            globally_used_b_ids,
-                            min_score=fallback_min_score,
-                        )
-                        if fb_b is not None:
-                            chosen_b = fb_b
-                            globally_used_b_ids.add(chosen_b)
-                            scope_same = fb_score >= 0.62
-                            confidence = max(confidence, fb_score)
-                            if fb_reason:
-                                rationales.append(fb_reason)
-                        else:
-                            # Last chance lexical rescue for cases where model reasoning is too strict.
-                            best_b: LineItem | None = None
-                            best_desc_overlap = 0.0
-                            for b_item in b_items:
-                                if b_item.id in globally_used_b_ids:
-                                    continue
-                                overlap = _token_overlap_on_shorter(a_item.description or "", b_item.description or "")
-                                if overlap > best_desc_overlap:
-                                    best_desc_overlap = overlap
-                                    best_b = b_item
-                            if best_b is not None and best_desc_overlap >= 0.82:
-                                chosen_b = best_b.id
-                                globally_used_b_ids.add(chosen_b)
-                                scope_same = True
-                                confidence = max(confidence, min(0.70, best_desc_overlap))
-                                rationales.append(
-                                    f"lexical rescue overlap={best_desc_overlap:.2f} to prevent false blue"
-                                )
-
-                if chosen_b is not None and chosen_b in b_by_id:
-                    semantic_chosen, desc_sim_chosen, desc_overlap_chosen = _semantic_same(
-                        a_item.description or "",
-                        b_by_id[chosen_b].description or "",
-                        scope_same_hint=scope_same,
-                        scope_sim_threshold=scope_sim_threshold,
-                        scope_overlap_threshold=scope_overlap_threshold,
-                    )
-                    if not semantic_chosen and not scope_same:
-                        # Only release if LLM also said NOT same scope AND text sim is low.
-                        # If scope_same=True, keep the pair — persist loop will classify as orange.
-                        if chosen_b in globally_used_b_ids:
-                            globally_used_b_ids.remove(chosen_b)
-                        rationales.append(
-                            "released non-semantic candidate "
-                            f"B={chosen_b} (desc_sim={desc_sim_chosen:.2f}, overlap={desc_overlap_chosen:.2f})"
-                        )
-                        chosen_b = None
-                        scope_same = False
-
-                if chosen_b is None:
-                    # Blue guardrail: only keep blue when no strong semantic candidate exists.
-                    rescue_sim_threshold = max(0.34, scope_sim_threshold - 0.08)
-                    rescue_overlap_threshold = max(0.48, scope_overlap_threshold - 0.08)
-                    best_unused: tuple[float, int, float, float] | None = None
-                    best_any: tuple[float, int, bool, bool, float, float] | None = None
-                    for b_item in b_items:
-                        desc_sim = _token_jaccard(a_item.description or "", b_item.description or "")
-                        desc_overlap = _token_overlap_on_shorter(a_item.description or "", b_item.description or "")
-                        semantic = bool(
-                            desc_sim >= rescue_sim_threshold
-                            or desc_overlap >= rescue_overlap_threshold
-                        )
-                        semantic_strength = max(desc_sim, desc_overlap * 0.98)
-                        if best_any is None or semantic_strength > best_any[0]:
-                            best_any = (
-                                semantic_strength,
-                                b_item.id,
-                                semantic,
-                                b_item.id in globally_used_b_ids,
-                                desc_sim,
-                                desc_overlap,
-                            )
-                        if b_item.id in globally_used_b_ids:
-                            continue
-                        if not semantic:
-                            continue
-                        if best_unused is None or semantic_strength > best_unused[0]:
-                            best_unused = (semantic_strength, b_item.id, desc_sim, desc_overlap)
-
-                    if best_unused is not None:
-                        score_u, b_id_u, desc_sim_u, desc_overlap_u = best_unused
-                        if score_u >= max(0.32, blue_guard_unused_threshold):
-                            chosen_b = b_id_u
-                            scope_same = True
-                            confidence = max(confidence, score_u)
-                            globally_used_b_ids.add(chosen_b)
-                            rationales.append(
-                                "blue-guard reassigned to unused semantic candidate "
-                                f"B={b_id_u} score={score_u:.2f} "
-                                f"(desc_sim={desc_sim_u:.2f}, overlap={desc_overlap_u:.2f})"
-                            )
-
-                    if chosen_b is None and best_any is not None:
-                        score_a, b_id_a, semantic_a, used_flag, desc_sim_a, desc_overlap_a = best_any
-                        if (
-                            semantic_a
-                            and score_a >= max(0.44, blue_guard_consumed_threshold + 0.08)
-                            and (desc_sim_a >= 0.40 or desc_overlap_a >= 0.50)
-                        ):
-                            force_status = "orange"
-                            if used_flag:
-                                rationales.append(
-                                    "blue-guard: close semantic candidate "
-                                    f"B={b_id_a} score={score_a:.2f} "
-                                    f"(desc_sim={desc_sim_a:.2f}, overlap={desc_overlap_a:.2f}) "
-                                    "already consumed by a higher-priority pair"
-                                )
-
-                assigned_for_a[a_id] = {
-                    "item_b_id": chosen_b,
-                    "scope_same": scope_same,
-                    "confidence": confidence,
-                    "rationales": rationales,
-                    "force_status": force_status,
-                }
-
-            # Reconciliation pass: pair remaining A-only and B-only rows using deterministic similarity.
-            unmatched_a_ids = [a.id for a in a_items if assigned_for_a[a.id]["item_b_id"] is None]
-            remaining_b_ids = [b.id for b in b_items if b.id not in globally_used_b_ids]
-            if unmatched_a_ids and remaining_b_ids:
-                pair_candidates: list[tuple[float, float, float, int, int]] = []
-                for a_item in a_items:
-                    if a_item.id not in unmatched_a_ids:
-                        continue
-                    for b_id in remaining_b_ids:
-                        b_item = b_by_id[b_id]
-                        score, desc_sim, amt_sim = _pair_similarity(a_item, b_item)
-                        if score < reconcile_min_score:
-                            continue
-                        pair_candidates.append((score, desc_sim, amt_sim, a_item.id, b_id))
-
-                pair_candidates.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
-                used_a_ids: set[int] = set()
-                used_b_ids_local: set[int] = set()
-                for score, desc_sim, amt_sim, a_id, b_id in pair_candidates:
-                    if a_id in used_a_ids or b_id in used_b_ids_local or b_id in globally_used_b_ids:
-                        continue
-                    used_a_ids.add(a_id)
-                    used_b_ids_local.add(b_id)
+            for conf, a_id, b_id, scope_same, rationale in proposals:
+                if b_id is not None and b_id in b_by_id and b_id not in globally_used_b_ids:
                     globally_used_b_ids.add(b_id)
+                    assigned_for_a[a_id] = {"item_b_id": b_id, "scope_same": scope_same,
+                                            "confidence": conf, "rationale": rationale}
+                else:
+                    # B already taken or null — mark unmatched
+                    if b_id is not None and b_id in globally_used_b_ids:
+                        rationale = f"{rationale} | B={b_id} already claimed by higher-confidence pair"
+                    assigned_for_a[a_id] = {"item_b_id": None, "scope_same": False,
+                                            "confidence": conf, "rationale": rationale}
 
-                    current = assigned_for_a[a_id]
-                    revised_scope_same = bool(
-                        desc_sim >= reconcile_scope_desc_sim
-                        or (desc_sim >= 0.50 and amt_sim >= 0.75)
-                    )
-                    revised_conf = max(float(current["confidence"]), float(score))
-                    revised_rationales = list(current["rationales"])
-                    revised_rationales.append(
-                        f"reconciled similarity={score:.2f} (desc={desc_sim:.2f}, amount={amt_sim:.2f})"
-                    )
-                    assigned_for_a[a_id] = {
-                        "item_b_id": b_id,
-                        "scope_same": revised_scope_same,
-                        "confidence": revised_conf,
-                        "rationales": revised_rationales,
-                    }
-
-            # Price-proximity rescue: catch any still-unmatched A items via price + desc signal.
-            _price_proximity_rescue(
-                a_items,
-                b_by_id,
-                assigned_for_a,
-                globally_used_b_ids,
-                green_price_tol=min(green_amount_tol, rescue_green_price_tol),
-                orange_price_tol=rescue_orange_price_tol,
-                min_desc_sim_green=rescue_min_desc_sim_green,
-                min_desc_sim_orange=rescue_min_desc_sim_orange,
-            )
-
-            # Persist in source order for readability/debugging.
+            # ── Persist: classify each assignment and write to DB ────────────────────
             for a_item in a_items:
                 a_id = a_item.id
-                result = assigned_for_a[a_id]
+                result = assigned_for_a.get(a_id, {"item_b_id": None, "scope_same": False,
+                                                    "confidence": 0.0, "rationale": "no proposal"})
                 chosen_b = result["item_b_id"]
                 scope_same = result["scope_same"]
                 confidence = float(result["confidence"])
-                rationales = result["rationales"]
-                force_status = result.get("force_status")
+                rationale = result["rationale"]
 
-                a_amt = a_item.amount
-                b_item_matched = b_by_id.get(chosen_b) if chosen_b is not None else None
-                b_amt = b_item_matched.amount if b_item_matched is not None else None
-                if force_status in {"orange", "green"}:
-                    status = str(force_status)
-                elif chosen_b is None:
+                if chosen_b is None:
+                    # No match from LLM → Blue
                     status = "blue"
                 else:
-                    semantic_same, desc_sim, desc_overlap = _semantic_same(
-                        a_item.description or "",
-                        b_by_id[chosen_b].description or "",
-                        scope_same_hint=scope_same,
-                        scope_sim_threshold=scope_sim_threshold,
-                        scope_overlap_threshold=scope_overlap_threshold,
+                    b_item_matched = b_by_id[chosen_b]
+                    # scope_same=True means LLM confirmed same underlying task → orange or green
+                    # scope_same=False means LLM matched but was uncertain → orange
+                    metadata_within_tol, _, mismatch_fields = _metadata_tolerance_result(
+                        a_item, b_item_matched, tol=green_amount_tol,
                     )
-                    metadata_within_tol = False
-                    amount_within_tol = False
-                    mismatch_fields: list[str] = []
-                    if b_item_matched is not None:
-                        metadata_within_tol, amount_within_tol, mismatch_fields = _metadata_tolerance_result(
-                            a_item,
-                            b_item_matched,
-                            tol=green_amount_tol,
-                        )
-                    if mismatch_fields:
-                        rationales.append(
-                            f"metadata differs beyond ±{green_amount_tol*100:.0f}%: {', '.join(mismatch_fields)}"
-                        )
-
-                    if semantic_same or scope_same:
-                        # semantic_same: text similarity confirms scope match
-                        # scope_same: LLM explicitly confirmed same scope (trust even with low text overlap)
-                        # Green requires BOTH scope confirmed AND all metadata within ±2% — 2% rule preserved.
-                        status = "green" if (amount_within_tol and metadata_within_tol) else "orange"
+                    if scope_same and metadata_within_tol:
+                        status = "green"
                     else:
-                        status = "blue"
-                        rationales.append("non-semantic candidate downgraded to blue in final classification")
-                        if chosen_b in globally_used_b_ids:
-                            globally_used_b_ids.remove(chosen_b)
-                        chosen_b = None
+                        status = "orange"
+                    if mismatch_fields:
+                        rationale = f"{rationale} | metadata differs: {', '.join(mismatch_fields)}"
 
                 if status == "blue":
-                    # Use LLM's assessment (second-pass takes priority; fall back to first-pass)
                     llm_critical = second_critical_blue.get(a_id, first_critical_blue.get(a_id, False))
                     if llm_critical:
-                        rationales.append(
-                            "[CRITICAL_BLUE] LLM-flagged: high-priority JDR-only scope; explicit reviewer attention required"
-                        )
-                        critical_blue_items.append(
-                            {
-                                "item_a_id": int(a_item.id),
-                                "room_a": a_item.room,
-                                "page": int(a_item.page),
-                                "description": (a_item.description or "")[:180],
-                            }
-                        )
+                        rationale = f"{rationale} | [CRITICAL_BLUE] high-priority JDR-only scope"
+                        critical_blue_items.append({
+                            "item_a_id": int(a_item.id),
+                            "room_a": a_item.room,
+                            "page": int(a_item.page),
+                            "description": (a_item.description or "")[:180],
+                        })
 
                 db.add(
                     Match(
@@ -1649,7 +1154,7 @@ def match_run(run_id: str, min_room_confidence: float = 0.6, min_pair_confidence
                         item_b_id=chosen_b,
                         status=status,
                         similarity=confidence,
-                        rationale=" | ".join(x for x in rationales if x)[:1500],
+                        rationale=rationale[:1500],
                     )
                 )
                 inserted += 1
