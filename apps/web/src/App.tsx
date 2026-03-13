@@ -1,7 +1,7 @@
 /** Main UI flow for PDF upload, streamed pipeline progress, and report download. */
 
 import { useCallback, useMemo, useRef, useState } from "react";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, useMutation } from "@tanstack/react-query";
 import { Download, FileText, FileUp } from "lucide-react";
 import { uploadRun, streamPipeline, reportUrl, type PipelineEvent } from "./api";
 import { Badge } from "./components/ui/badge";
@@ -53,7 +53,13 @@ function AppInner() {
   const [activeStep, setActiveStep] = useState<string | null>(null);
   const [logs, setLogs] = useState<StepLog[]>([]);
   const [summary, setSummary] = useState<SummaryStats | null>(null);
+  const [renderReady, setRenderReady] = useState(false);
   const cleanupRef = useRef<(() => void) | null>(null);
+
+  const uploadMutation = useMutation({
+    mutationFn: ({ proposalA, proposalB }: { proposalA: File; proposalB: File }) =>
+      uploadRun(proposalA, proposalB),
+  });
 
   const addLog = useCallback(
     (msg: string, isError = false) =>
@@ -105,6 +111,9 @@ function AppInner() {
           });
         }
 
+        if (event.step === "render") {
+          setRenderReady(true);
+        }
         if (event.step === "done") {
           setBusy(false);
           setActiveStep(null);
@@ -129,9 +138,10 @@ function AppInner() {
       setRunId(null);
       setSummary(null);
       setActiveStep(null);
+      setRenderReady(false);
 
       addLog("Uploading PDFs…");
-      const up = await uploadRun(proposalA, proposalB);
+      const up = await uploadMutation.mutateAsync({ proposalA, proposalB });
       setRunId(up.run_id);
       addLog(`Uploaded. run_id=${up.run_id}`);
 
@@ -149,7 +159,7 @@ function AppInner() {
     }
   };
 
-  const downloadHref = useMemo(() => (runId ? reportUrl(runId) : null), [runId]);
+  const downloadHref = useMemo(() => (runId && renderReady ? reportUrl(runId) : null), [runId, renderReady]);
   const isDone = !busy && runId != null;
 
   return (

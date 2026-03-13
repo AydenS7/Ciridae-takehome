@@ -298,6 +298,8 @@ def _parse_doc_item_rooms(page_texts: list[tuple[int, str]]) -> list[tuple[int, 
             totals_m = _TOTALS_LINE_RE.match(line)
             if totals_m:
                 room_name = re.sub(r"\s+", " ", totals_m.group(1)).strip()
+                # Strip trailing price columns (e.g. "Bathroom 187.16 1,449.50 8,698.64" → "Bathroom")
+                room_name = re.sub(r"\s+\d[\d\s,]*\.\d[\d\s,\.]*$", "", room_name).strip()
                 # Strip trailing "continued" qualifier
                 room_name = re.sub(r"\s*-?\s*continued\s*$", "", room_name, flags=re.IGNORECASE).strip()
                 if room_name:

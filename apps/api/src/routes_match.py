@@ -2,15 +2,13 @@
 
 from __future__ import annotations
 
-import heapq
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
 from difflib import SequenceMatcher
 from time import perf_counter
 
 from fastapi import APIRouter, HTTPException
-from sqlalchemy import delete, func
+from sqlalchemy import delete, func, select
 
 from .db import SessionLocal
 from .models import Run
@@ -23,6 +21,7 @@ from .matching_llm import (
     propose_matches_for_room_ensemble,
 )
 from .settings import settings
+from .schemas import MatchResponse, MatchItemResponse
 
 router = APIRouter(prefix="/runs", tags=["matching"])
 
@@ -52,100 +51,71 @@ _STOPWORDS = {
     "an",
 }
 
-_CRITICAL_BLUE_KEYWORDS = {
-    "megohmmeter",
-    "electrical",
-    "testing",
-    "test",
-    "permit",
-    "code",
-    "mold",
-    "asbestos",
-    "lead",
-    "engineer",
+_UNIT_NORMALIZE: dict[str, str] = {
+    "sq ft": "sf", "sqft": "sf", "sq. ft.": "sf", "sq. ft": "sf",
+    "square foot": "sf", "square feet": "sf", "sq.ft.": "sf",
+    "lin ft": "lf", "lin. ft": "lf", "lin. ft.": "lf",
+    "linear foot": "lf", "linear feet": "lf", "lineal foot": "lf", "lineal feet": "lf",
+    "each": "ea",
+    "sq yd": "sy", "square yard": "sy", "square yards": "sy",
+    "hour": "hr", "hours": "hr",
+    "month": "mo", "week": "wk", "day": "day",
 }
 
-_UNIT_CANONICAL: dict[str, str] = {
-    "EA": "EA",
-    "EACH": "EA",
-    "HR": "HR",
-    "HOUR": "HR",
-    "HOURS": "HR",
-    "HRS": "HR",
-    "SF": "SF",
-    "SQFT": "SF",
-    "SQUAREFEET": "SF",
-    "LF": "LF",
-    "LINFT": "LF",
-    "LINEARFEET": "LF",
-    "SY": "SY",
-    "SQYD": "SY",
-    "SQUAREYARDS": "SY",
+_SPEC_COMBO_RE = re.compile(
+    r'\b(\d+(?:/\d+)?)\s*(?:[-\u2013]\s*)?(?:coat|ply|gauge|ga|mil|inch|in(?=\b))',
+    re.IGNORECASE,
+)
+_FRACTION_RE = re.compile(r'\b\d+/\d+\b')
+_WORD_TO_DIGIT: dict[str, str] = {
+    "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
+    "six": "6", "seven": "7", "eight": "8", "nine": "9", "ten": "10",
 }
 
+
+def _normalize_unit(unit: str) -> str:
+    u = (unit or "").strip().lower()
+    return _UNIT_NORMALIZE.get(u, u)
+
+
+def _desc_spec_markers(desc: str) -> frozenset[str]:
+    """Extract spec markers from a description: fractions (1/2, 5/8) and number+unit combos (2-coat, 3/4 inch)."""
+    text = (desc or "").lower()
+    # Normalize inch symbols
+    text = text.replace('"', ' inch ').replace("''", ' inch ')
+    # Normalize word numbers so "one coat" → "1 coat" is caught by _SPEC_COMBO_RE
+    for word, digit in _WORD_TO_DIGIT.items():
+        text = re.sub(rf'\b{word}\b', digit, text)
+    fracs = set(_FRACTION_RE.findall(text))
+    combos = {
+        re.sub(r'[\s\-\u2013]', '', m.group(0).lower())
+        for m in _SPEC_COMBO_RE.finditer(text)
+    }
+    return frozenset(fracs | combos)
+
+
+_ROOM_TYPE_DISTINGUISHERS: set[str] = {
+    "closet",
+    "bathroom",
+    "bath",
+    "kitchen",
+    "garage",
+    "basement",
+    "laundry",
+    "pantry",
+    "foyer",
+    "entry",
+    "porch",
+    "deck",
+    "attic",
+    "office",
+    "linen",
+}
 
 def _tokens(text: str) -> set[str]:
     toks = {t for t in _TOKEN_RE.findall((text or "").lower()) if len(t) > 2}
     return {t for t in toks if t not in _STOPWORDS}
 
-
-def _canonical_unit(unit: str | None) -> str:
-    raw = (unit or "").strip().upper()
-    if not raw:
-        return ""
-    key = re.sub(r"[^A-Z0-9]", "", raw)
-    return _UNIT_CANONICAL.get(key, key)
-
-
-def _has_meaningful_description(text: str) -> bool:
-    toks = _tokens(text or "")
-    if len(toks) < 2:
-        return False
-    alpha = sum(1 for ch in (text or "") if ch.isalpha())
-    return alpha >= 4
-
-
-def _is_critical_blue_description(text: str) -> bool:
-    toks = _tokens(text or "")
-    if not toks:
-        return False
-    return any(k in toks for k in _CRITICAL_BLUE_KEYWORDS)
-
-
-def _token_jaccard(a: str, b: str) -> float:
-    ta = _tokens(a)
-    tb = _tokens(b)
-    if not ta or not tb:
-        return 0.0
-    inter = len(ta & tb)
-    union = len(ta | tb)
-    if union == 0:
-        return 0.0
-    return inter / union
-
-
-def _amount_closeness(a: float | None, b: float | None) -> float:
-    if a is None or b is None:
-        return 0.0
-    d = _pct_diff(a, b)
-    if d <= 0.02:
-        return 1.0
-    if d <= 0.1:
-        return 0.75
-    if d <= 0.25:
-        return 0.45
-    if d <= 0.5:
-        return 0.2
-    return 0.0
-
-
-def _token_overlap_on_shorter(a: str, b: str) -> float:
-    ta = _tokens(a)
-    tb = _tokens(b)
-    if not ta or not tb:
-        return 0.0
-    inter = len(ta & tb)
-    return inter / max(1, min(len(ta), len(tb)))
 
 
 def _set_jaccard(a: set[str], b: set[str]) -> float:
@@ -156,20 +126,6 @@ def _set_jaccard(a: set[str], b: set[str]) -> float:
     if union == 0:
         return 0.0
     return inter / union
-
-
-def _normalized_name(text: str) -> str:
-    toks = [t for t in _TOKEN_RE.findall((text or "").lower()) if len(t) > 2 and t not in _STOPWORDS]
-    return " ".join(toks)
-
-
-def _name_similarity_score(a_desc: str, b_desc: str) -> float:
-    desc_sim = _token_jaccard(a_desc, b_desc)
-    desc_overlap = _token_overlap_on_shorter(a_desc, b_desc)
-    norm_a = _normalized_name(a_desc)
-    norm_b = _normalized_name(b_desc)
-    seq_sim = SequenceMatcher(None, norm_a, norm_b).ratio() if norm_a and norm_b else 0.0
-    return max(desc_sim, desc_overlap, seq_sim)
 
 
 def _room_name_tokens(name: str) -> list[str]:
@@ -192,10 +148,20 @@ def _room_name_similarity(a: str, b: str) -> float:
 
     sa = set(ta)
     sb = set(tb)
-    overlap_shorter = len(sa & sb) / max(1, min(len(sa), len(sb)))
+
+    # If the symmetric difference contains a room-type distinguisher, these are
+    # different physical spaces — hard-cap so they never expand into each other.
+    unique_to_a = sa - sb
+    unique_to_b = sb - sa
+    if (unique_to_a | unique_to_b) & _ROOM_TYPE_DISTINGUISHERS:
+        return 0.25
+
+    inter = len(sa & sb)
+    union = len(sa | sb)
+    jaccard = inter / union if union else 0.0
     seq = SequenceMatcher(None, " ".join(ta), " ".join(tb)).ratio()
     tail_bonus = 0.92 if ta[-1] == tb[-1] else 0.0
-    return max(overlap_shorter, seq, tail_bonus)
+    return max(jaccard, seq, tail_bonus)
 
 
 def _expand_candidate_rooms(
@@ -307,222 +273,6 @@ def _soft_room_candidates(
     return list(all_rooms_b[: max(1, min(limit, len(all_rooms_b)))])
 
 
-def _pair_similarity(a_item: LineItem, b_item: LineItem) -> tuple[float, float, float]:
-    desc_sim = _token_jaccard(a_item.description or "", b_item.description or "")
-    amt_sim = _amount_closeness(a_item.amount, b_item.amount)
-    score = (0.78 * desc_sim) + (0.22 * amt_sim)
-    return score, desc_sim, amt_sim
-
-
-def _semantic_same(
-    a_desc: str,
-    b_desc: str,
-    *,
-    scope_same_hint: bool,
-    scope_sim_threshold: float,
-    scope_overlap_threshold: float,
-) -> tuple[bool, float, float]:
-    desc_sim = _token_jaccard(a_desc, b_desc)
-    desc_overlap = _token_overlap_on_shorter(a_desc, b_desc)
-    seq_sim = _name_similarity_score(a_desc, b_desc)
-    semantic_from_text = bool(
-        desc_sim >= scope_sim_threshold
-        or desc_overlap >= scope_overlap_threshold
-        or seq_sim >= max(0.58, scope_sim_threshold + 0.10)
-    )
-    # Include LLM scope hint to recover paraphrase cases that are semantically same but lexically far apart.
-    # Keep a tiny lexical floor to avoid obvious random pairings.
-    semantic_from_hint = bool(scope_same_hint) and bool(max(desc_sim, desc_overlap, seq_sim) >= 0.08)
-    semantic = bool(semantic_from_text or semantic_from_hint)
-    return semantic, desc_sim, desc_overlap
-
-
-@dataclass
-class _MCFEdge:
-    to: int
-    rev: int
-    cap: int
-    cost: int
-
-
-def _add_mcf_edge(graph: list[list[_MCFEdge]], u: int, v: int, cap: int, cost: int) -> None:
-    graph[u].append(_MCFEdge(to=v, rev=len(graph[v]), cap=cap, cost=cost))
-    graph[v].append(_MCFEdge(to=u, rev=len(graph[u]) - 1, cap=0, cost=-cost))
-
-
-def _min_cost_max_flow(
-    graph: list[list[_MCFEdge]],
-    source: int,
-    sink: int,
-    max_flow: int,
-) -> tuple[int, int]:
-    n = len(graph)
-    flow = 0
-    total_cost = 0
-
-    while flow < max_flow:
-        dist = [10**18] * n
-        parent_v = [-1] * n
-        parent_e = [-1] * n
-        dist[source] = 0
-        heap: list[tuple[int, int]] = [(0, source)]
-
-        while heap:
-            d, v = heapq.heappop(heap)
-            if d != dist[v]:
-                continue
-            for ei, e in enumerate(graph[v]):
-                if e.cap <= 0:
-                    continue
-                nd = d + e.cost
-                if nd < dist[e.to]:
-                    dist[e.to] = nd
-                    parent_v[e.to] = v
-                    parent_e[e.to] = ei
-                    heapq.heappush(heap, (nd, e.to))
-
-        if dist[sink] >= 10**18:
-            break
-
-        add_flow = max_flow - flow
-        v = sink
-        while v != source:
-            pv = parent_v[v]
-            pe = parent_e[v]
-            if pv < 0 or pe < 0:
-                add_flow = 0
-                break
-            add_flow = min(add_flow, graph[pv][pe].cap)
-            v = pv
-
-        if add_flow <= 0:
-            break
-
-        v = sink
-        while v != source:
-            pv = parent_v[v]
-            pe = parent_e[v]
-            e = graph[pv][pe]
-            e.cap -= add_flow
-            rev = graph[v][e.rev]
-            rev.cap += add_flow
-            v = pv
-
-        flow += add_flow
-        total_cost += add_flow * dist[sink]
-
-    return flow, total_cost
-
-
-def _optimize_room_assignment(
-    *,
-    a_ids: list[int],
-    b_ids: list[int],
-    score_by_a: dict[int, dict[int, float]],
-    unmatched_threshold: float,
-) -> dict[int, int | None]:
-    assignment: dict[int, int | None] = {a_id: None for a_id in a_ids}
-    if not a_ids:
-        return assignment
-    if not b_ids:
-        return assignment
-
-    na = len(a_ids)
-    nb = len(b_ids)
-    source = 0
-    a0 = 1
-    b0 = a0 + na
-    sink = b0 + nb
-    graph: list[list[_MCFEdge]] = [[] for _ in range(sink + 1)]
-
-    a_index = {a_id: a0 + i for i, a_id in enumerate(a_ids)}
-    b_index = {b_id: b0 + i for i, b_id in enumerate(b_ids)}
-    b_index_rev = {idx: b_id for b_id, idx in b_index.items()}
-    unmatched_cost = int(round((1.0 - max(0.0, min(1.0, unmatched_threshold))) * 1000))
-
-    for a_id in a_ids:
-        ai = a_index[a_id]
-        _add_mcf_edge(graph, source, ai, 1, 0)
-        _add_mcf_edge(graph, ai, sink, 1, unmatched_cost)
-        for b_id, score in score_by_a.get(a_id, {}).items():
-            if b_id not in b_index:
-                continue
-            # Lower cost = better. Map score directly to [0,1] so score > unmatched_threshold wins.
-            clamped = max(0.0, min(1.0, float(score)))
-            edge_cost = int(round((1.0 - clamped) * 1000))
-            _add_mcf_edge(graph, ai, b_index[b_id], 1, edge_cost)
-
-    for b_id in b_ids:
-        _add_mcf_edge(graph, b_index[b_id], sink, 1, 0)
-
-    _min_cost_max_flow(graph, source, sink, len(a_ids))
-
-    for a_id in a_ids:
-        ai = a_index[a_id]
-        chosen_b: int | None = None
-        for e in graph[ai]:
-            if e.to < b0 or e.to >= sink:
-                continue
-            rev = graph[e.to][e.rev]
-            if rev.cap > 0:
-                chosen_b = b_index_rev[e.to]
-                break
-        assignment[a_id] = chosen_b
-
-    return assignment
-
-
-def _choice_quality(
-    *,
-    a_item: LineItem,
-    choice: tuple[int | None, bool, float, str] | None,
-    b_by_id: dict[int, LineItem],
-    green_amount_tol: float,
-    scope_sim_threshold: float,
-    scope_overlap_threshold: float,
-) -> float:
-    if choice is None:
-        return float("-inf")
-    b_id, _scope_same, conf, _ = choice
-    if b_id is None or b_id not in b_by_id:
-        return float("-inf")
-
-    b_item = b_by_id[b_id]
-    desc_sim = _token_jaccard(a_item.description or "", b_item.description or "")
-    desc_overlap = _token_overlap_on_shorter(a_item.description or "", b_item.description or "")
-    amt_sim = _amount_closeness(a_item.amount, b_item.amount)
-    a_amt = a_item.amount
-    b_amt = b_item.amount
-    within_tol = (_pct_diff(a_amt, b_amt) <= green_amount_tol) if (a_amt is not None and b_amt is not None) else False
-    semantic = bool(desc_sim >= scope_sim_threshold or desc_overlap >= scope_overlap_threshold)
-
-    score = (0.45 * float(conf)) + (0.35 * desc_sim) + (0.20 * amt_sim)
-    if semantic:
-        score += 0.14
-    if within_tol:
-        score += 0.26
-    return score
-
-
-def _any_number_match(a_item: LineItem, b_item: LineItem, tol: float) -> bool:
-    """
-    Count how many numeric values from A cross-match numeric values from B within tolerance.
-    Each A value and B value can only be used once (greedy best-first).
-    Fields compared: amount, unit_price, quantity — any combination counts.
-    Returns the number of matched pairs.
-    """
-    a_vals = [v for v in (a_item.amount, a_item.unit_price, a_item.quantity) if v is not None and v > 0]
-    b_vals = [v for v in (b_item.amount, b_item.unit_price, b_item.quantity) if v is not None and v > 0]
-    used_b: set[int] = set()
-    matches = 0
-    # Try each A value against all unused B values; take first match found.
-    for av in a_vals:
-        for bi, bv in enumerate(b_vals):
-            if bi not in used_b and _pct_diff(av, bv) <= tol:
-                used_b.add(bi)
-                matches += 1
-                break
-    return matches
 
 
 def _metadata_tolerance_result(
@@ -532,25 +282,57 @@ def _metadata_tolerance_result(
     tol: float,
 ) -> tuple[bool, bool, list[str]]:
     """
-    Returns:
-    - metadata_within_tol: 3+ numeric cross-matches found (green threshold)
-    - amount_within_tol: same as metadata_within_tol (kept for compatibility)
-    - mismatch_fields: informational — fields present on both sides that differ beyond tol
+    Returns (green, pricing_within_tol, mismatch_fields).
+
+    Green: ALL metadata fields present on both sides must agree within ±tol.
+    Fields checked: amount, quantity, unit_price.
+    If a field is absent on either side it is skipped (can't compare).
+    When NO fields are comparable, fall back to computed qty×unit_price totals.
     """
-    match_count = _any_number_match(a_item, b_item, tol)
-    green = match_count >= 3
+    a_amt = a_item.amount
+    b_amt = b_item.amount
+    a_qty = a_item.quantity
+    b_qty = b_item.quantity
+    a_up = a_item.unit_price
+    b_up = b_item.unit_price
 
-    # Informational mismatch list for rationale string only.
     mismatch_fields: list[str] = []
-    for name, av, bv in [
-        ("amount", a_item.amount, b_item.amount),
-        ("quantity", a_item.quantity, b_item.quantity),
-        ("unit_price", a_item.unit_price, b_item.unit_price),
-    ]:
-        if av is not None and bv is not None and _pct_diff(av, bv) > tol:
-            mismatch_fields.append(name)
+    comparable_count = 0
 
-    return green, green, mismatch_fields
+    for name, av, bv in [
+        ("amount", a_amt, b_amt),
+        ("quantity", a_qty, b_qty),
+        ("unit_price", a_up, b_up),
+    ]:
+        if av is not None and bv is not None:
+            comparable_count += 1
+            if _pct_diff(av, bv) > tol:
+                mismatch_fields.append(name)
+
+    if comparable_count > 0:
+        green = len(mismatch_fields) == 0
+        return green, green, mismatch_fields
+
+    # No direct fields to compare — fall back to computed qty×unit_price totals.
+    a_computed = (
+        (a_qty or 0) * (a_up or 0)
+        if a_qty is not None and a_up is not None
+        else None
+    )
+    b_computed = (
+        (b_qty or 0) * (b_up or 0)
+        if b_qty is not None and b_up is not None
+        else None
+    )
+    fallback_ok = False
+    if a_computed and b_computed and _pct_diff(a_computed, b_computed) <= tol:
+        fallback_ok = True
+    elif a_amt is not None and b_computed and _pct_diff(a_amt, b_computed) <= tol:
+        fallback_ok = True
+    elif b_amt is not None and a_computed and _pct_diff(b_amt, a_computed) <= tol:
+        fallback_ok = True
+
+    return fallback_ok, fallback_ok, mismatch_fields
 
 
 def _nugget_signature(room_b: str, description: str, amount: float | None) -> tuple[str, str, float | None]:
@@ -561,36 +343,6 @@ def _nugget_signature(room_b: str, description: str, amount: float | None) -> tu
     return ((room_b or "").strip().lower(), desc, amt)
 
 
-def _fallback_match(
-    a_item: LineItem,
-    b_items: list[LineItem],
-    used_b: set[int],
-    *,
-    min_score: float = 0.42,
-) -> tuple[int | None, float, str]:
-    best_id: int | None = None
-    best_score = 0.0
-    best_reason = ""
-
-    a_desc = a_item.description or ""
-    for b in b_items:
-        if b.id in used_b:
-            continue
-        desc_sim = _token_jaccard(a_desc, b.description or "")
-        amt_sim = _amount_closeness(a_item.amount, b.amount)
-        score = (0.78 * desc_sim) + (0.22 * amt_sim)
-
-        if score > best_score:
-            best_score = score
-            best_id = b.id
-            best_reason = f"fallback similarity={score:.2f} (desc={desc_sim:.2f}, amount={amt_sim:.2f})"
-
-    # Conservative threshold to avoid false matches.
-    if best_id is None or best_score < min_score:
-        return None, 0.0, ""
-    return best_id, best_score, best_reason
-
-
 def _best_pairs_by_a(plan) -> dict[int, tuple[int | None, bool, float, str]]:
     best: dict[int, tuple[int | None, bool, float, str]] = {}
     for p in plan.pairs:
@@ -599,85 +351,6 @@ def _best_pairs_by_a(plan) -> dict[int, tuple[int | None, bool, float, str]]:
         if cur is None or candidate[2] > cur[2]:
             best[p.item_a_id] = candidate
     return best
-
-
-def _price_proximity_rescue(
-    a_items: list,
-    b_by_id: dict,
-    assigned_for_a: dict,
-    globally_used_b_ids: set,
-    *,
-    green_price_tol: float = 0.05,
-    orange_price_tol: float = 0.15,
-    min_desc_sim_green: float = 0.40,
-    min_desc_sim_orange: float = 0.20,
-) -> None:
-    """
-    Final rescue pass for still-unmatched A items: search unused B items by price proximity.
-    If price is close AND descriptions have some overlap, force orange or green.
-    Mutates assigned_for_a and globally_used_b_ids in-place.
-    """
-    unmatched_a = [a for a in a_items if assigned_for_a.get(a.id, {}).get("item_b_id") is None]
-    if not unmatched_a:
-        return
-    available_b = [b for b in b_by_id.values() if b.id not in globally_used_b_ids]
-    if not available_b:
-        return
-
-    for a_item in unmatched_a:
-        a_amt = a_item.amount
-        if a_amt is None:
-            continue
-
-        best_b = None
-        best_composite = 0.0
-        best_price_diff = float("inf")
-        best_forced_status: str | None = None
-
-        for b_item in available_b:
-            b_amt = b_item.amount
-            if b_amt is None:
-                continue
-            price_diff = _pct_diff(a_amt, b_amt)
-            if price_diff > orange_price_tol:
-                continue
-
-            desc_sim = _token_jaccard(a_item.description or "", b_item.description or "")
-            amt_closeness = _amount_closeness(a_amt, b_amt)
-            composite = (0.45 * desc_sim) + (0.55 * amt_closeness)
-
-            if price_diff <= green_price_tol and desc_sim >= min_desc_sim_green:
-                forced_status = "green"
-            elif price_diff <= orange_price_tol and desc_sim >= min_desc_sim_orange:
-                forced_status = "orange"
-            else:
-                continue
-
-            if composite > best_composite or (
-                composite == best_composite and price_diff < best_price_diff
-            ):
-                best_composite = composite
-                best_price_diff = price_diff
-                best_b = b_item
-                best_forced_status = forced_status
-
-        if best_b is not None and best_forced_status is not None:
-            globally_used_b_ids.add(best_b.id)
-            available_b = [b for b in available_b if b.id != best_b.id]
-            desc_sim_final = _token_jaccard(a_item.description or "", best_b.description or "")
-            current = assigned_for_a.get(a_item.id, {})
-            rationales = list(current.get("rationales", []))
-            rationales.append(
-                f"price-proximity rescue → {best_forced_status} "
-                f"(price_diff={best_price_diff:.1%}, desc_sim={desc_sim_final:.2f})"
-            )
-            assigned_for_a[a_item.id] = {
-                "item_b_id": best_b.id,
-                "scope_same": best_forced_status == "green",
-                "confidence": max(float(current.get("confidence") or 0.0), best_composite),
-                "rationales": rationales,
-                "force_status": best_forced_status,
-            }
 
 
 def _critical_blue_by_a(plan) -> dict[int, bool]:
@@ -760,7 +433,7 @@ def _run_llm_for_room(
     }
 
 
-@router.post("/{run_id}/match")
+@router.post("/{run_id}/match", response_model=MatchResponse)
 def match_run(run_id: str, min_room_confidence: float = 0.6):
     """
     LLM-only pairing per mapped room, deterministic classification:
@@ -783,17 +456,14 @@ def match_run(run_id: str, min_room_confidence: float = 0.6):
             raise HTTPException(status_code=404, detail="run not found")
 
         # must have extracted items
-        n_items = db.query(func.count(LineItem.id)).filter(LineItem.run_id == run_id).scalar() or 0
+        n_items = db.scalar(select(func.count(LineItem.id)).where(LineItem.run_id == run_id)) or 0
         if n_items == 0:
             raise HTTPException(status_code=400, detail="no extracted items; run /extract first")
 
         # must have room mapping candidates
-        room_links_all = (
-            db.query(RoomMap)
-            .filter(RoomMap.run_id == run_id)
-            .order_by(RoomMap.confidence.desc())
-            .all()
-        )
+        room_links_all = list(db.scalars(
+            select(RoomMap).where(RoomMap.run_id == run_id).order_by(RoomMap.confidence.desc())
+        ))
         if not room_links_all:
             raise HTTPException(status_code=400, detail="no room mapping; run /map-rooms first")
 
@@ -808,34 +478,24 @@ def match_run(run_id: str, min_room_confidence: float = 0.6):
                 best_room_a_for_room_b[link.room_b] = link.room_a
                 best_room_a_score_for_room_b[link.room_b] = conf
 
-        rooms_a = [
-            r[0]
-            for r in db.query(LineItem.room)
-            .filter(LineItem.run_id == run_id, LineItem.doc == "A")
-            .distinct()
-            .all()
-        ]
-        all_rooms_b = [
-            r[0]
-            for r in db.query(LineItem.room)
-            .filter(LineItem.run_id == run_id, LineItem.doc == "B")
-            .distinct()
-            .all()
-        ]
+        rooms_a = list(db.scalars(
+            select(LineItem.room).where(LineItem.run_id == run_id, LineItem.doc == "A").distinct()
+        ))
+        all_rooms_b = list(db.scalars(
+            select(LineItem.room).where(LineItem.run_id == run_id, LineItem.doc == "B").distinct()
+        ))
         a_room_desc_tokens: dict[str, set[str]] = {}
-        for room_name, desc in (
-            db.query(LineItem.room, LineItem.description)
-            .filter(LineItem.run_id == run_id, LineItem.doc == "A")
-            .all()
+        for room_name, desc in db.execute(
+            select(LineItem.room, LineItem.description)
+            .where(LineItem.run_id == run_id, LineItem.doc == "A")
         ):
             if room_name not in a_room_desc_tokens:
                 a_room_desc_tokens[room_name] = set()
             a_room_desc_tokens[room_name].update(_tokens(desc or ""))
         b_room_desc_tokens: dict[str, set[str]] = {}
-        for room_name, desc in (
-            db.query(LineItem.room, LineItem.description)
-            .filter(LineItem.run_id == run_id, LineItem.doc == "B")
-            .all()
+        for room_name, desc in db.execute(
+            select(LineItem.room, LineItem.description)
+            .where(LineItem.run_id == run_id, LineItem.doc == "B")
         ):
             if room_name not in b_room_desc_tokens:
                 b_room_desc_tokens[room_name] = set()
@@ -866,12 +526,11 @@ def match_run(run_id: str, min_room_confidence: float = 0.6):
         room_preps: list[dict] = []
         for room_a in rooms_a:
             room_links = links_by_room_a.get(room_a, [])
-            a_items = (
-                db.query(LineItem)
-                .filter(LineItem.run_id == run_id, LineItem.doc == "A", LineItem.room == room_a)
+            a_items = list(db.scalars(
+                select(LineItem)
+                .where(LineItem.run_id == run_id, LineItem.doc == "A", LineItem.room == room_a)
                 .order_by(LineItem.page, LineItem.id)
-                .all()
-            )
+            ))
             if not a_items:
                 continue
 
@@ -930,16 +589,15 @@ def match_run(run_id: str, min_room_confidence: float = 0.6):
             room_alias_expanded = len(expanded_room_bs) > len(candidate_room_bs)
             room_b = ", ".join(expanded_room_bs)
 
-            b_items = (
-                db.query(LineItem)
-                .filter(
+            b_items = list(db.scalars(
+                select(LineItem)
+                .where(
                     LineItem.run_id == run_id,
                     LineItem.doc == "B",
                     LineItem.room.in_(expanded_room_bs),
                 )
                 .order_by(LineItem.page, LineItem.id)
-                .all()
-            )
+            ))
 
             if not b_items:
                 soft_candidates = _soft_room_candidates(
@@ -952,16 +610,15 @@ def match_run(run_id: str, min_room_confidence: float = 0.6):
                 if soft_candidates:
                     room_map_mode = "global-room-fallback"
                     room_b = ", ".join(soft_candidates)
-                    b_items = (
-                        db.query(LineItem)
-                        .filter(
+                    b_items = list(db.scalars(
+                        select(LineItem)
+                        .where(
                             LineItem.run_id == run_id,
                             LineItem.doc == "B",
                             LineItem.room.in_(soft_candidates),
                         )
                         .order_by(LineItem.page, LineItem.id)
-                        .all()
-                    )
+                    ))
 
             if not b_items:
                 room_preps.append({
@@ -1131,6 +788,34 @@ def match_run(run_id: str, min_room_confidence: float = 0.6):
                         status = "green"
                     else:
                         status = "orange"
+
+                    if status == "green":
+                        # Any field that's present on both sides and differs beyond tol → orange.
+                        if mismatch_fields:
+                            status = "orange"
+                    if status == "green":
+                        # Guard: measurement unit type differs (SF vs LF makes rates incomparable).
+                        a_unit = _normalize_unit(a_item.unit or "")
+                        b_unit = _normalize_unit(b_item_matched.unit or "")
+                        if a_unit and b_unit and a_unit != b_unit:
+                            status = "orange"
+                            mismatch_fields = mismatch_fields + [f"unit ({a_item.unit} vs {b_item_matched.unit})"]
+                        # Guard 2: spec markers differ in descriptions (e.g. "1/2 inch" vs "5/8 inch",
+                        #          "2-coat" vs "1-coat").
+                        if status == "green":
+                            a_specs = _desc_spec_markers(a_item.description or "")
+                            b_specs = _desc_spec_markers(b_item_matched.description or "")
+                            if a_specs and b_specs and a_specs != b_specs:
+                                status = "orange"
+                                mismatch_fields = mismatch_fields + [f"specs ({set(a_specs)} vs {set(b_specs)})"]
+
+                    # Belt-and-suspenders: if amounts are present and differ by more than
+                    # the green tolerance, force orange regardless of other logic.
+                    if status == "green" and a_item.amount is not None and b_item_matched.amount is not None:
+                        if _pct_diff(a_item.amount, b_item_matched.amount) > green_amount_tol:
+                            status = "orange"
+                            mismatch_fields = mismatch_fields + [f"amount ({a_item.amount} vs {b_item_matched.amount})"]
+
                     if mismatch_fields:
                         rationale = f"{rationale} | metadata differs: {', '.join(mismatch_fields)}"
 
@@ -1162,12 +847,11 @@ def match_run(run_id: str, min_room_confidence: float = 0.6):
                 matched_a_ids_seen.add(a_id)
 
         # Add insurance-only nuggets (Doc B items not matched to any A item).
-        all_b_items = (
-            db.query(LineItem)
-            .filter(LineItem.run_id == run_id, LineItem.doc == "B")
+        all_b_items = list(db.scalars(
+            select(LineItem)
+            .where(LineItem.run_id == run_id, LineItem.doc == "B")
             .order_by(LineItem.page, LineItem.id)
-            .all()
-        )
+        ))
         seen_nugget_sigs: set[tuple[str, str, float | None]] = set()
         for b_item in all_b_items:
             if b_item.id in globally_used_b_ids:
@@ -1199,12 +883,9 @@ def match_run(run_id: str, min_room_confidence: float = 0.6):
             status_counts["nugget"] = int(status_counts.get("nugget", 0)) + 1
 
         db.commit()
-        total_a_items = (
-            db.query(func.count(LineItem.id))
-            .filter(LineItem.run_id == run_id, LineItem.doc == "A")
-            .scalar()
-            or 0
-        )
+        total_a_items = db.scalar(
+            select(func.count(LineItem.id)).where(LineItem.run_id == run_id, LineItem.doc == "A")
+        ) or 0
         coverage_audit = {
             "total_a_items": int(total_a_items),
             "matched_a_rows": int(len(matched_a_ids_seen)),
@@ -1223,7 +904,6 @@ def match_run(run_id: str, min_room_confidence: float = 0.6):
             "second_pass_reviewed_count": second_pass_reviewed_count,
             "second_pass_rooms_invoked": second_pass_rooms_invoked,
             "nugget_count": nugget_count,
-            "blue_guardrail": "null/low-conf forced to pass2; rescue+reconcile before blue",
             "status_counts": status_counts,
             "coverage_audit": coverage_audit,
             "llm_telemetry": get_match_telemetry(),
@@ -1233,14 +913,14 @@ def match_run(run_id: str, min_room_confidence: float = 0.6):
             "room_group_room_a_coverage": int(len(room_group_b_by_room_a)),
         }
 
-@router.get("/{run_id}/matches")
+@router.get("/{run_id}/matches", response_model=list[MatchItemResponse])
 def list_matches(run_id: str, status: str | None = None, limit: int = 200):
     with SessionLocal() as db:
-        q = db.query(Match).filter(Match.run_id == run_id)
+        stmt = select(Match).where(Match.run_id == run_id)
         if status:
-            q = q.filter(Match.status == status)
+            stmt = stmt.where(Match.status == status)
 
-        rows = q.order_by(Match.id).limit(limit).all()
+        rows = list(db.scalars(stmt.order_by(Match.id).limit(limit)))
         return [
             {
                 "room_a": r.room_a,

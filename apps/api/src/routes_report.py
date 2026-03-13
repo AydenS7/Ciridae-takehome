@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
-from sqlalchemy import func
+from sqlalchemy import func, select
 from time import perf_counter
 
 from .db import SessionLocal
@@ -13,12 +13,13 @@ from .models import Run
 from .models_items import LineItem
 from .models_matches import Match
 from .render_report import render_report_pdf
+from .schemas import RenderResponse
 
 router = APIRouter(prefix="/runs", tags=["report"])
 
 REPORT_DIR = Path("data/reports")
 
-@router.post("/{run_id}/render")
+@router.post("/{run_id}/render", response_model=RenderResponse)
 def render(run_id: str):
     t0 = perf_counter()
     with SessionLocal() as db:
@@ -26,7 +27,7 @@ def render(run_id: str):
         if not run:
             raise HTTPException(status_code=404, detail="run not found")
 
-        matches = db.query(Match).filter(Match.run_id == run_id).order_by(Match.id).all()
+        matches = list(db.scalars(select(Match).where(Match.run_id == run_id).order_by(Match.id)))
         if not matches:
             raise HTTPException(status_code=400, detail="no matches; run /match first")
 
@@ -34,15 +35,14 @@ def render(run_id: str):
         ids_a = [m.item_a_id for m in matches if m.item_a_id is not None]
         ids_b = [m.item_b_id for m in matches if m.item_b_id is not None]
 
-        a_items = {x.id: x for x in db.query(LineItem).filter(LineItem.id.in_(ids_a)).all()} if ids_a else {}
-        b_items = {x.id: x for x in db.query(LineItem).filter(LineItem.id.in_(ids_b)).all()} if ids_b else {}
+        a_items = {x.id: x for x in db.scalars(select(LineItem).where(LineItem.id.in_(ids_a)))} if ids_a else {}
+        b_items = {x.id: x for x in db.scalars(select(LineItem).where(LineItem.id.in_(ids_b)))} if ids_b else {}
         a_room_first_page = {
             room: page
-            for room, page in (
-                db.query(LineItem.room, func.min(LineItem.page))
-                .filter(LineItem.run_id == run_id, LineItem.doc == "A")
+            for room, page in db.execute(
+                select(LineItem.room, func.min(LineItem.page))
+                .where(LineItem.run_id == run_id, LineItem.doc == "A")
                 .group_by(LineItem.room)
-                .all()
             )
         }
 

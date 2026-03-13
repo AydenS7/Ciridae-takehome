@@ -4,8 +4,9 @@ from concurrent.futures import ThreadPoolExecutor
 import re
 
 from fastapi import APIRouter, HTTPException
+from .schemas import ExtractResponse, LineItemResponse
 import pdfplumber
-from sqlalchemy import delete
+from sqlalchemy import delete, select
 from time import perf_counter
 
 from .db import SessionLocal
@@ -109,7 +110,7 @@ def _index_coverage_report(pdf_path: str, doc_pages: list) -> dict:
         "pages": pages,
     }
 
-@router.post("/{run_id}/extract")
+@router.post("/{run_id}/extract", response_model=ExtractResponse)
 def extract_run(run_id: str):
     t0 = perf_counter()
     with SessionLocal() as db:
@@ -175,13 +176,13 @@ def extract_run(run_id: str):
             },
         }
 
-@router.get("/{run_id}/items")
+@router.get("/{run_id}/items", response_model=list[LineItemResponse])
 def list_items(run_id: str, doc: str | None = None, limit: int = 200):
     with SessionLocal() as db:
-        q = db.query(LineItem).filter(LineItem.run_id == run_id)
+        stmt = select(LineItem).where(LineItem.run_id == run_id)
         if doc:
-            q = q.filter(LineItem.doc == doc)
-        items = q.order_by(LineItem.doc, LineItem.page, LineItem.id).limit(limit).all()
+            stmt = stmt.where(LineItem.doc == doc)
+        items = list(db.scalars(stmt.order_by(LineItem.doc, LineItem.page, LineItem.id).limit(limit)))
 
         return [
             {

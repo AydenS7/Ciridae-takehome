@@ -39,11 +39,6 @@ class Settings(BaseSettings):
     matching_blue_guard_unused_threshold: float = 0.30
     matching_blue_guard_consumed_threshold: float = 0.38
     matching_green_text_exact_tolerance_pct: float = 0.06
-    # Price-proximity rescue: after all other matching, rescue still-blue A items by price closeness
-    rescue_green_price_tol: float = 0.05    # ±5% → can force green (if desc_sim also passes)
-    rescue_orange_price_tol: float = 0.15   # ±15% → can force orange
-    rescue_min_desc_sim_green: float = 0.40  # min token-Jaccard for green rescue
-    rescue_min_desc_sim_orange: float = 0.20 # min token-Jaccard for orange rescue
 
     @property
     def matching_second_pass_model_list(self) -> list[str]:

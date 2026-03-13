@@ -24,6 +24,12 @@ Rules:
   (for example added qualifiers/prefixes/suffixes), but do not merge clearly distinct numbered rooms.
 - Prefer high precision: include a link only if it's likely correct.
 - Provide a short rationale for each link.
+
+CRITICAL — do NOT merge rooms that are physically distinct spaces:
+- "Bedroom" and "Bedroom Closet" are DIFFERENT rooms. A closet is a separate space.
+- Any room name that adds a room-type word (Closet, Bathroom, Kitchen, Garage, Laundry, Pantry, etc.)
+  to another name describes a DIFFERENT room, not the same one.
+- Only link rooms when the names describe the same physical space.
 """
 
 
@@ -36,6 +42,26 @@ _ROOMMAP_ALIAS_MAP: dict[str, str] = {
     "claude": "anthropic/claude-opus-4-5",
     "gemini": "gemini/gemini-2.5-pro",
     "google": "gemini/gemini-2.5-pro",
+}
+
+# Words that define a room TYPE — if one name has such a word and the other doesn't,
+# they are clearly different physical spaces and must not be merged.
+_ROOM_TYPE_DISTINGUISHERS: set[str] = {
+    "closet",
+    "bathroom",
+    "bath",
+    "kitchen",
+    "garage",
+    "basement",
+    "laundry",
+    "pantry",
+    "foyer",
+    "entry",
+    "porch",
+    "deck",
+    "attic",
+    "office",
+    "linen",
 }
 
 _ROOM_STOPWORDS: set[str] = {
@@ -121,10 +147,21 @@ def _room_name_similarity(a: str, b: str) -> float:
 
     sa = set(ta)
     sb = set(tb)
-    subset_overlap = len(sa & sb) / max(1, min(len(sa), len(sb)))
+
+    # If the symmetric difference contains a room-type distinguisher, these are physically
+    # different spaces (e.g. "Bedroom" vs "Bedroom Closet"). Hard-cap the score so they
+    # never reach the deterministic-accept or even ambiguous threshold.
+    unique_to_a = sa - sb
+    unique_to_b = sb - sa
+    if (unique_to_a | unique_to_b) & _ROOM_TYPE_DISTINGUISHERS:
+        return 0.25
+
+    # Use Jaccard (inter/union) instead of containment ratio so that "Bedroom" vs
+    # "Master Bedroom" scores ~0.5 rather than 1.0.
+    jaccard = _set_jaccard(sa, sb)
     seq = SequenceMatcher(None, " ".join(ta), " ".join(tb)).ratio()
     suffix_match_bonus = 0.92 if ta and tb and ta[-1] == tb[-1] else 0.0
-    return max(subset_overlap, seq, suffix_match_bonus)
+    return max(jaccard, seq, suffix_match_bonus)
 
 
 def _normalize_profile_tokens(tokens: Iterable[str]) -> set[str]:
@@ -423,6 +460,23 @@ def map_rooms_via_llm(
     for room in rooms_b:
         room_profile_tokens_b.setdefault(room, set())
 
+    # Guarantee: rooms with identical normalized names always map (e.g. "Main Level" → "Main Level").
+    # This runs before deterministic scoring, which can miss exact matches when all name tokens
+    # are stopwords (e.g. "main" and "level" are both stopwords → name_similarity = 0.0).
+    exact_match_links: list[RoomLink] = []
+    for room_a in rooms_a:
+        a_norm = room_a.strip().lower()
+        for room_b in rooms_b:
+            if room_b.strip().lower() == a_norm:
+                exact_match_links.append(
+                    RoomLink(
+                        room_a=room_a,
+                        room_b=room_b,
+                        confidence=0.99,
+                        rationale="exact-name-match",
+                    )
+                )
+
     ranked_pairs = _rank_room_pairs(
         rooms_a,
         rooms_b,
@@ -461,7 +515,7 @@ def map_rooms_via_llm(
             llm_telemetry["invoked"] = True
             llm_telemetry["ambiguous_pairs_sent"] = len(limited_ambiguous)
 
-    merged_links = _limit_links_per_room(_merge_links(deterministic_links, llm_links))
+    merged_links = _limit_links_per_room(_merge_links(exact_match_links, deterministic_links, llm_links))
     result = RoomMapResult(links=merged_links)
     groups = _connected_room_groups(rooms_a, rooms_b, merged_links)
 

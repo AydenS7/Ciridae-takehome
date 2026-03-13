@@ -31,6 +31,19 @@ scope_same:
 - true  → same underlying repair task (use whenever names are close or candidates exist)
 - false → matched but genuinely uncertain — use sparingly, only for truly ambiguous wording
 
+Labor-only items: JDR estimates sometimes separate labor from material as distinct line items
+(e.g. "Door prep - Labor only" alongside "Door hardware - material"). Insurance estimates
+typically bundle labor into the combined work item without a separate "Labor only" line.
+If an A item ends in "- Labor only" or "- labor" and the B side has no matching "Labor only"
+item, match it to the B item covering the same underlying task (the one that would include
+the labor). Use scope_same=true — the work IS covered, just not split out.
+
+Specification awareness — scope_same = false when descriptions differ on:
+- Material specs: "1/2 inch plywood" ≠ "5/8 inch plywood"; "1-coat" ≠ "2-coat"
+- Quantities in description text: "2 windows" vs "1 window" is a scope difference
+- Grade/type markers: e.g. "Type X drywall" ≠ "standard drywall"
+Ignore minor wording variations (e.g. "1/2\"" vs "1/2 inch" are the same).
+
 One-to-one: each B item may be used at most once. If two A items want the same B item, assign it to the closer name match and find the next best for the other.
 
 For null matches: set critical_blue=true if the item is high-priority scope
@@ -46,9 +59,12 @@ For every uncertain A item, output exactly one ProposedPair. Count your output b
 Rules:
 - If exact or near-name candidate exists, match it — the name IS the ground truth.
 - Return null only when no B item in the room plausibly covers the same task — not just because wording differs.
-- scope_same=true when same task; scope_same=false only when the description is genuinely ambiguous.
+- scope_same=true when same task; scope_same=false when specs differ (thickness, coat count, quantities in description, material grade) or description is genuinely ambiguous.
 - Override first-pass null if a name candidate exists. Override first-pass match only if it's clearly wrong.
 - One sentence rationale: why you confirmed or overrode the first pass.
+- Labor-only items: if an A item says "- Labor only" and the first pass returned null, check
+  whether a B item covers the same underlying task (insurance bundles labor in; no separate
+  "Labor only" line is expected). If so, override to that B item with scope_same=true.
 
 For null matches: set critical_blue=true for high-priority omitted scope
 (permits, electrical, safety testing, code compliance, hazards, engineering, liability-critical work).

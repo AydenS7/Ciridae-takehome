@@ -5,13 +5,14 @@ from pathlib import Path
 from fastapi import APIRouter, UploadFile, File, HTTPException
 from .db import SessionLocal
 from .models import Run
+from .schemas import UploadResponse
 
 router = APIRouter(prefix="/uploads", tags=["uploads"])
 
 UPLOAD_DIR = Path("data/uploads")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-@router.post("")
+@router.post("", response_model=UploadResponse)
 async def upload(proposal_a: UploadFile = File(...), proposal_b: UploadFile = File(...)):
     run_id = str(uuid.uuid4())
     out_dir = UPLOAD_DIR / run_id

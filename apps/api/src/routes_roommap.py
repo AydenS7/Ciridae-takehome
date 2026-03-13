@@ -2,7 +2,7 @@
 
 import re
 from fastapi import APIRouter, HTTPException
-from sqlalchemy import delete, func
+from sqlalchemy import delete, func, select
 from time import perf_counter
 
 from .db import SessionLocal
@@ -11,6 +11,7 @@ from .models_items import LineItem
 from .models_roommap import RoomMap
 from .room_mapping import build_room_groups_from_links, map_rooms_via_llm
 from .llm_roommap_schemas import RoomLink
+from .schemas import RoomLinkResponse, RoomMapResponse
 
 router = APIRouter(prefix="/runs", tags=["room-mapping"])
 
@@ -23,7 +24,7 @@ def _desc_tokens(text: str) -> set[str]:
     }
 
 
-@router.post("/{run_id}/map-rooms")
+@router.post("/{run_id}/map-rooms", response_model=RoomMapResponse)
 def map_rooms(run_id: str):
     t0 = perf_counter()
     with SessionLocal() as db:
@@ -32,19 +33,18 @@ def map_rooms(run_id: str):
             raise HTTPException(status_code=404, detail="run not found")
 
         # Must have extracted items first
-        n_items = db.query(func.count(LineItem.id)).filter(LineItem.run_id == run_id).scalar() or 0
+        n_items = db.scalar(select(func.count(LineItem.id)).where(LineItem.run_id == run_id)) or 0
         if n_items == 0:
             raise HTTPException(status_code=400, detail="no extracted items; run /extract first")
 
-        rooms_a = [r[0] for r in db.query(LineItem.room).filter(LineItem.run_id == run_id, LineItem.doc == "A").distinct().all()]
-        rooms_b = [r[0] for r in db.query(LineItem.room).filter(LineItem.run_id == run_id, LineItem.doc == "B").distinct().all()]
+        rooms_a = list(db.scalars(select(LineItem.room).where(LineItem.run_id == run_id, LineItem.doc == "A").distinct()))
+        rooms_b = list(db.scalars(select(LineItem.room).where(LineItem.run_id == run_id, LineItem.doc == "B").distinct()))
 
         room_profile_tokens_a: dict[str, set[str]] = {}
         room_profile_tokens_b: dict[str, set[str]] = {}
-        for room, desc, doc in (
-            db.query(LineItem.room, LineItem.description, LineItem.doc)
-            .filter(LineItem.run_id == run_id)
-            .all()
+        for room, desc, doc in db.execute(
+            select(LineItem.room, LineItem.description, LineItem.doc)
+            .where(LineItem.run_id == run_id)
         ):
             if doc == "A":
                 room_profile_tokens_a.setdefault(room, set()).update(_desc_tokens(desc or ""))
@@ -110,15 +110,14 @@ def map_rooms(run_id: str):
         }
 
 
-@router.get("/{run_id}/map-rooms")
+@router.get("/{run_id}/map-rooms", response_model=list[RoomLinkResponse])
 def get_room_map(run_id: str, min_confidence: float = 0.6, include_groups: bool = False):
     with SessionLocal() as db:
-        links = (
-            db.query(RoomMap)
-            .filter(RoomMap.run_id == run_id, RoomMap.confidence >= min_confidence)
+        links = list(db.scalars(
+            select(RoomMap)
+            .where(RoomMap.run_id == run_id, RoomMap.confidence >= min_confidence)
             .order_by(RoomMap.confidence.desc())
-            .all()
-        )
+        ))
         payload = [
             {
                 "room_a": l.room_a,
@@ -131,8 +130,8 @@ def get_room_map(run_id: str, min_confidence: float = 0.6, include_groups: bool 
         if not include_groups:
             return payload
 
-        rooms_a = [r[0] for r in db.query(LineItem.room).filter(LineItem.run_id == run_id, LineItem.doc == "A").distinct().all()]
-        rooms_b = [r[0] for r in db.query(LineItem.room).filter(LineItem.run_id == run_id, LineItem.doc == "B").distinct().all()]
+        rooms_a = list(db.scalars(select(LineItem.room).where(LineItem.run_id == run_id, LineItem.doc == "A").distinct()))
+        rooms_b = list(db.scalars(select(LineItem.room).where(LineItem.run_id == run_id, LineItem.doc == "B").distinct()))
         room_groups = build_room_groups_from_links(
             rooms_a=rooms_a,
             rooms_b=rooms_b,
